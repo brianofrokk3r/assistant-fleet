@@ -8,6 +8,8 @@ render one hardened Compose project per tenant, and operate those projects throu
 the local Docker daemon. Copilot, Codex, and OpenCode remain independent provider
 choices for either network adapter.
 
+![Assistant Fleet dashboard showing the ACME deployment](docs/assistant-fleet-dashboard.png)
+
 ## Start with Docker Compose
 
 Docker Engine with Compose v2 is required.

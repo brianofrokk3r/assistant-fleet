@@ -167,7 +167,6 @@ export function validateTenantConfiguration(value: unknown): ValidationResult {
     required('teamId', 'Slack team ID');
     required('installationId', 'Slack installation ID');
     required('allowedChannels', 'Slack allowed channels');
-    required('allowedUsers', 'Slack allowed users');
     required('slackAppTokenRef', 'Slack app-token reference');
     required('slackBotTokenRef', 'Slack bot-token reference');
     if (config.securityMode !== 'shared') errors.push('Slack requires shared security mode.');

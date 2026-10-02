@@ -240,7 +240,7 @@ function NewDeployment({ onClose, onCreate, initial }: { onClose: () => void; on
   const selectType = (type: AdapterType) => setForm(v => ({ ...v, type, registerCommands: type === 'discord' }));
   const selectProvider = (provider: ProviderType) => setForm(v => ({ ...v, provider, model: provider === 'copilot' ? 'claude-haiku-4.5' : provider === 'codex' ? 'gpt-5.6-sol' : '' }));
   const typeValid = form.type === 'slack'
-    ? form.teamId && form.installationId && form.allowedChannels && form.allowedUsers && form.slackAppTokenRef && form.slackBotTokenRef
+    ? form.teamId && form.installationId && form.allowedChannels && form.slackAppTokenRef && form.slackBotTokenRef
     : form.discordAppId && form.discordGuildId && form.discordTokenRef;
   const authValid = form.providerAuthMode === 'persisted-login' || form.providerSecretRef;
   const valid = form.name && form.slug && form.image.includes(':') && !form.image.endsWith(':latest') && typeValid && authValid;
@@ -268,7 +268,7 @@ function NewDeployment({ onClose, onCreate, initial }: { onClose: () => void; on
             <label><span>Slack team ID</span><input value={form.teamId} onChange={e => update('teamId', e.target.value.toUpperCase())} placeholder="T0123456789" /></label>
             <label><span>Installation ID</span><input value={form.installationId} onChange={e => update('installationId', e.target.value)} placeholder="default" /></label>
             <label><span>Allowed channel IDs</span><input value={form.allowedChannels} onChange={e => update('allowedChannels', e.target.value)} placeholder="C0123,C0456" /></label>
-            <label><span>Allowed user IDs</span><input value={form.allowedUsers} onChange={e => update('allowedUsers', e.target.value)} placeholder="U0123,U0456" /></label>
+            <label><span>Allowed user IDs (optional)</span><input value={form.allowedUsers} onChange={e => update('allowedUsers', e.target.value)} placeholder="Empty permits all channel members" /></label>
             <label><span>App token secret reference</span><input value={form.slackAppTokenRef} onChange={e => update('slackAppTokenRef', e.target.value)} /></label>
             <label><span>Bot token secret reference</span><input value={form.slackBotTokenRef} onChange={e => update('slackBotTokenRef', e.target.value)} /></label>
           </>}
@@ -475,7 +475,7 @@ function ContractPage() {
   const rules = [
     ['One process per workspace', 'Each Slack workspace runs as an independent Compose project.'],
     ['Dedicated persistent state', 'Data volumes, adapter state, and writable workspaces are never shared.'],
-    ['Explicit Slack access', 'Team identity, installation namespace, channels, and users must be configured.'],
+    ['Explicit Slack access', 'Team identity, installation namespace, and channels must be configured. User restrictions are optional.'],
     ['Pinned reviewed artifacts', 'Application images, skill bundles, and repository snapshots use exact revisions.'],
     ['Read-only knowledge', 'Approved repository snapshots mount below the tenant knowledge workspace.'],
     ['Secrets outside the workspace', 'Slack tokens, provider credentials, and Git keys are not persisted here.'],

@@ -29,6 +29,11 @@ test('Slack adapter and OpenCode provider remain independent', () => {
   assert.equal(deployment.provider, 'OpenCode');
 });
 
+test('Slack user allowlist is optional', () => {
+  const validation = validateTenantConfiguration({ ...base(), allowedUsers: '' });
+  assert.equal(validation.valid, true);
+});
+
 test('Discord requires application, guild, and token reference', () => {
   const config = { ...base(), type: 'discord' as const, discordAppId: '', discordGuildId: '' };
   const validation = validateTenantConfiguration(config);

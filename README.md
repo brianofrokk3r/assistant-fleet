@@ -64,7 +64,7 @@ docker compose config --quiet
 - In-place migration support for existing data volumes, managed workspaces, auxiliary secret references, and tenant-local n8n intake relays
 - Deploy, suspend, resume, verify, rollback, and container-log operations
 - Immutable read-only knowledge snapshot mounts
-- Read-only rendered skillset mounts at the provider-standard path
+- Reviewed skillsets copied into each tenant's writable provider directory by a one-shot initializer
 - Activity history, configuration editing, JSON export, and 15-second refresh
 
 ## Secret references
@@ -83,6 +83,27 @@ supported secret source); tenant records store references to those secrets.
 Only the resolved child `docker compose` process receives secret values. Generated
 YAML and `deployment.json` retain placeholders/references. `.env.console`, runtime
 state, rendered tenants, secret files, and promoted snapshots are ignored by Git.
+
+## Provider authentication
+
+Provider state and credentials are isolated in each tenant's named data volume.
+Choosing **Persisted CLI login** does not share an existing login with a new
+tenant. After its first deployment, authenticate inside that tenant's assistant
+container. For a Codex tenant named `acme`:
+
+```bash
+docker exec -it assistant-acme-assistant-1 codex login --device-auth
+docker exec assistant-acme-assistant-1 codex login status
+```
+
+Complete the device flow printed by the first command. The resulting Codex login
+is stored only in `assistant-acme-data`; another tenant needs its own login. Normal
+redeploys and container recreation preserve it because they retain the named
+volume. Removing the tenant volume removes the persisted login.
+
+Alternatively, choose **Secret reference** in the tenant form and provide a
+tenant-specific reference for `OPENAI_API_KEY`. The control plane resolves that
+reference only when it launches the tenant Compose project.
 
 ## Fleet directories
 

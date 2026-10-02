@@ -1,0 +1,52 @@
+services:
+  fleet-console:
+    build:
+      context: .
+    image: assistant-fleet-console:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FLEET_PORT:-8080}:8080"
+    environment:
+      FLEET_ROOT: ${PWD}
+      FLEET_UI_DIR: /app/dist
+      FLEET_BIND_HOST: 0.0.0.0
+      FLEET_PORT: 8080
+      FLEET_DOCKER_ENABLED: "true"
+    env_file:
+      - path: .env.console
+        required: false
+    volumes:
+      # Keep fleet paths identical inside the controller and on the Docker host so
+      # generated tenant bind mounts resolve correctly through the host daemon.
+      - type: bind
+        source: ./data
+        target: ${PWD}/data
+      - type: bind
+        source: ./tenants
+        target: ${PWD}/tenants
+      - type: bind
+        source: ./rendered-skillsets
+        target: ${PWD}/rendered-skillsets
+      - type: bind
+        source: ./repository-snapshots
+        target: ${PWD}/repository-snapshots
+      - type: bind
+        source: ./runtime
+        target: ${PWD}/runtime
+        read_only: true
+      - type: bind
+        source: ./secrets
+        target: /run/secrets
+        read_only: true
+      - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5

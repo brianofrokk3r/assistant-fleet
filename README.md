@@ -32,6 +32,11 @@ Do not expose it directly to a network; put an authenticated reverse proxy in
 front of it if remote administration is required. Tenant assistant and browser
 containers never receive the Docker socket.
 
+## Adapter setup guides
+
+- [Create and configure a Slack app](docs/slack-app-setup.md)
+- [Create and configure a Discord app](docs/discord-app-setup.md)
+
 ## Local development
 
 Requires Node.js 22.14+ and Docker Compose.

@@ -5,7 +5,7 @@ import { deploymentFromConfiguration, validateTenantConfiguration, type TenantCo
 const base = (): TenantConfiguration => ({
   name: 'Acme', slug: 'acme', environment: 'Staging', type: 'slack',
   image: 'ghcr.io/rubiss-projects/ai-assistant:v1.26.0', provider: 'opencode', model: 'openrouter/example',
-  teamId: 'T012345', installationId: 'acme', allowedChannels: 'C012345', allowedUsers: 'U012345',
+  slackAppId: 'A012345', teamId: 'T012345', installationId: 'acme', allowedChannels: 'C012345', allowedUsers: 'U012345',
   slackAppTokenRef: 'secret://slack/acme/app-token', slackBotTokenRef: 'secret://slack/acme/bot-token',
   discordAppId: '', discordGuildId: '', discordAllowedUsers: '', discordAdminUsers: '',
   discordTokenRef: 'secret://discord/acme/bot-token', freeChannels: '', securityMode: 'shared',
@@ -27,6 +27,12 @@ test('Slack adapter and OpenCode provider remain independent', () => {
   const deployment = deploymentFromConfiguration(config);
   assert.equal(deployment.adapter, 'slack');
   assert.equal(deployment.provider, 'OpenCode');
+});
+
+test('Slack requires a per-tenant app ID', () => {
+  const validation = validateTenantConfiguration({ ...base(), slackAppId: '' });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join(' '), /Slack app ID/);
 });
 
 test('Discord requires application, guild, and token reference', () => {

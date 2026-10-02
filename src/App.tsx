@@ -168,6 +168,7 @@ function DetailPanel({ tenant, onClose, onAction, onEdit, onNavigate }: DetailPa
       <section className="detail-section">
         <div className="section-label">Isolation & access <ShieldCheck size={14} /></div>
         <dl className="facts">
+          {tenant.adapter === 'slack' && <div><dt>Slack app</dt><dd><code>{tenant.configuration?.slackAppId || 'Not configured'}</code></dd></div>}
           <div><dt>{tenant.adapter === 'discord' ? 'Discord guild' : 'Slack team'}</dt><dd><code>{tenant.teamId}</code></dd></div>
           <div><dt>Installation</dt><dd>{tenant.installationId}</dd></div>
           <div><dt>Allowlists</dt><dd>{tenant.channels} channels · {tenant.users} users</dd></div>
@@ -205,10 +206,10 @@ function NewDeployment({ onClose, onCreate, initial }: { onClose: () => void; on
   const [advanced, setAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const [form, setForm] = useState<TenantConfiguration>(() => initial ? { ...initial } : ({
+  const [form, setForm] = useState<TenantConfiguration>(() => initial ? { ...initial, slackAppId: initial.slackAppId ?? '' } : ({
     name: '', slug: '', environment: 'Staging', type: 'slack',
     image: 'ghcr.io/rubiss-projects/ai-assistant:v1.26.0', provider: 'copilot', model: 'claude-haiku-4.5',
-    teamId: '', installationId: 'default', allowedChannels: '', allowedUsers: '',
+    slackAppId: '', teamId: '', installationId: 'default', allowedChannels: '', allowedUsers: '',
     slackAppTokenRef: 'secret://slack/app-token', slackBotTokenRef: 'secret://slack/bot-token',
     discordAppId: '', discordGuildId: '', discordAllowedUsers: '', discordAdminUsers: '',
     discordTokenRef: 'secret://discord/bot-token', freeChannels: '',
@@ -240,7 +241,7 @@ function NewDeployment({ onClose, onCreate, initial }: { onClose: () => void; on
   const selectType = (type: AdapterType) => setForm(v => ({ ...v, type, registerCommands: type === 'discord' }));
   const selectProvider = (provider: ProviderType) => setForm(v => ({ ...v, provider, model: provider === 'copilot' ? 'claude-haiku-4.5' : provider === 'codex' ? 'gpt-5.6-sol' : '' }));
   const typeValid = form.type === 'slack'
-    ? form.teamId && form.installationId && form.allowedChannels && form.allowedUsers && form.slackAppTokenRef && form.slackBotTokenRef
+    ? form.slackAppId && form.teamId && form.installationId && form.allowedChannels && form.allowedUsers && form.slackAppTokenRef && form.slackBotTokenRef
     : form.discordAppId && form.discordGuildId && form.discordTokenRef;
   const authValid = form.providerAuthMode === 'persisted-login' || form.providerSecretRef;
   const valid = form.name && form.slug && form.image.includes(':') && !form.image.endsWith(':latest') && typeValid && authValid;
@@ -265,6 +266,7 @@ function NewDeployment({ onClose, onCreate, initial }: { onClose: () => void; on
           <label><span>Default provider</span><select value={form.provider} onChange={e => selectProvider(e.target.value as ProviderType)}><option value="copilot">GitHub Copilot</option><option value="codex">OpenAI Codex</option><option value="opencode">OpenCode</option></select></label>
 
           {form.type === 'slack' && <>
+            <label><span>Slack app ID</span><input value={form.slackAppId} onChange={e => update('slackAppId', e.target.value.toUpperCase())} placeholder="A0123456789" /></label>
             <label><span>Slack team ID</span><input value={form.teamId} onChange={e => update('teamId', e.target.value.toUpperCase())} placeholder="T0123456789" /></label>
             <label><span>Installation ID</span><input value={form.installationId} onChange={e => update('installationId', e.target.value)} placeholder="default" /></label>
             <label><span>Allowed channel IDs</span><input value={form.allowedChannels} onChange={e => update('allowedChannels', e.target.value)} placeholder="C0123,C0456" /></label>
@@ -429,6 +431,7 @@ function AccessPage({ deployments, onSelectTenant }: { deployments: Deployment[]
           <div className="access-card-head"><TenantAvatar tenant={tenant} /><div><b>{tenant.name}</b><span>{tenant.environment}</span></div><StatusPill status={tenant.status} /></div>
           <dl className="facts">
             <div><dt>Adapter</dt><dd className="capitalize">{tenant.adapter || 'slack'}</dd></div>
+            {tenant.adapter === 'slack' && <div><dt>Slack app</dt><dd><code>{tenant.configuration?.slackAppId || 'Not configured'}</code></dd></div>}
             <div><dt>{tenant.adapter === 'discord' ? 'Discord guild' : 'Slack team'}</dt><dd><code>{tenant.teamId}</code></dd></div>
             <div><dt>Installation</dt><dd>{tenant.installationId}</dd></div>
             <div><dt>Allowed channels</dt><dd>{tenant.channels}</dd></div>

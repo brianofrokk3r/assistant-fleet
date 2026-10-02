@@ -34,7 +34,6 @@ export interface TenantConfiguration {
   installationId: string;
   allowedChannels: string;
   allowedUsers: string;
-  slackAppId: string;
   slackAppTokenRef: string;
   slackBotTokenRef: string;
   discordAppId: string;
@@ -165,7 +164,6 @@ export function validateTenantConfiguration(value: unknown): ValidationResult {
   if (!['copilot', 'codex', 'opencode'].includes(config.provider ?? '')) errors.push('Provider must be copilot, codex, or opencode.');
   if (config.securityMode !== 'shared' && config.securityMode !== 'unrestricted') errors.push('Security mode is invalid.');
   if (config.type === 'slack') {
-    required('slackAppId', 'Slack app ID');
     required('teamId', 'Slack team ID');
     required('installationId', 'Slack installation ID');
     required('allowedChannels', 'Slack allowed channels');

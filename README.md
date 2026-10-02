@@ -77,9 +77,8 @@ references instead:
 - `env://MY_EXISTING_VARIABLE` resolves directly from that process variable.
 - `file:///run/secrets/acme-token` reads a file mounted through `secrets/`.
 
-Each Slack tenant also stores its non-secret Slack App ID (`A...`) and renders it
-as `SLACK_APP_ID`. The App ID belongs in the tenant form; only the `xapp-...` and
-`xoxb-...` values belong in `.env.console` (or another supported secret source).
+Slack `xapp-...` and `xoxb-...` values belong in `.env.console` (or another
+supported secret source); tenant records store references to those secrets.
 
 Only the resolved child `docker compose` process receives secret values. Generated
 YAML and `deployment.json` retain placeholders/references. `.env.console`, runtime

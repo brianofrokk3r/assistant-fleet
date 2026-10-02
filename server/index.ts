@@ -132,7 +132,6 @@ function composeEnvironment(config: TenantConfiguration): Record<string, string 
     environment.OPENCODE_TIMEOUT_MS = config.timeoutMs;
   }
   if (config.type === 'slack') {
-    environment.SLACK_APP_ID = config.slackAppId;
     environment.SLACK_TEAM_ID = config.teamId;
     environment.SLACK_ALLOWED_CHANNELS = config.allowedChannels;
     environment.SLACK_ALLOWED_USERS = config.allowedUsers;

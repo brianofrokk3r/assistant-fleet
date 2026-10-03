@@ -277,6 +277,43 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .repo-name b { font-size: 12px; }.repo-name small { color: #919791; font-size: 10px; margin-top: 3px; }
 .tenant-link { display: flex; align-items: center; gap: 9px; border: 0; padding: 0; background: transparent; cursor: pointer; font-size: 11px; font-weight: 600; text-align: left; }
 .repo-table-row > code { font: 10px 'DM Mono', monospace; background: #edf0ec; padding: 5px 7px; border-radius: 5px; width: max-content; }
+
+.repository-tabs { display: flex; width: max-content; padding: 4px; margin-bottom: 16px; border: 1px solid #dfe4df; border-radius: 10px; background: #eef1ed; gap: 4px; }
+.repository-tabs button { min-height: 36px; padding: 0 13px; border: 0; border-radius: 7px; background: transparent; color: #747c75; font: 600 11px inherit; display: flex; align-items: center; gap: 7px; cursor: pointer; }
+.repository-tabs button.active { background: white; color: #344138; box-shadow: 0 1px 3px rgba(28,37,30,.09); }
+.repository-tabs button > span { min-width: 20px; padding: 2px 6px; border-radius: 999px; background: #e5e9e4; color: #6d766e; font-size: 9px; text-align: center; }
+.repository-tabs button.active > span { background: #e8f1e9; color: #477052; }
+.contribution-form { margin-bottom: 16px; overflow: visible; }
+.contribution-form-head { min-height: 58px; padding: 0 18px; border-bottom: 1px solid #e6e9e5; display: flex; align-items: center; }
+.contribution-form-head b, .contribution-form-head span { display: block; }
+.contribution-form-head b { font-size: 13px; color: #3f4841; }
+.contribution-form-head span { margin-top: 3px; color: #899089; font-size: 10px; }
+.contribution-form-grid { padding: 18px; }
+.contribution-form-grid select[multiple] { min-height: 92px; padding: 5px; }
+.contribution-form-grid label > small { margin-top: 5px; color: #8b928c; font-size: 9px; }
+.contribution-form-actions { padding: 0 18px 18px; display: flex; justify-content: flex-end; gap: 8px; }
+.contribution-repo-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.contribution-repo-card { min-width: 0; padding: 16px; border: 1px solid #dfe4df; border-radius: 11px; background: white; box-shadow: 0 1px 2px rgba(28,37,30,.025); }
+.contribution-repo-card.disabled { opacity: .68; background: #fafbfa; }
+.contribution-repo-head { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding-bottom: 14px; border-bottom: 1px solid #edf0ec; }
+.contribution-repo-head > div:nth-child(2) { min-width: 0; }
+.contribution-repo-head b, .contribution-repo-head span { display: block; }
+.contribution-repo-head b { color: #344039; font-size: 13px; }
+.contribution-repo-head > div > span { margin-top: 3px; overflow: hidden; color: #848c85; font: 10px 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
+.contribution-repo-card .facts { padding: 13px 0; border-bottom: 1px solid #edf0ec; }
+.contribution-repo-card .facts code { max-width: 250px; overflow: hidden; text-overflow: ellipsis; }
+.assigned-tenants { padding-top: 13px; }
+.assigned-tenants > span { display: block; margin-bottom: 8px; color: #8a918b; font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.assigned-tenants > div { display: flex; min-height: 29px; flex-wrap: wrap; gap: 6px; }
+.assigned-tenants button { height: 29px; padding: 0 9px 0 4px; border: 1px solid #dfe5df; border-radius: 999px; background: #f7f9f6; color: #515a53; font-size: 9px; font-weight: 650; display: flex; align-items: center; gap: 5px; cursor: pointer; }
+.assigned-tenants .tenant-avatar.small { width: 21px; height: 21px; font-size: 7px; }
+.contribution-repo-actions { display: flex; justify-content: flex-end; align-items: center; gap: 7px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #edf0ec; }
+.icon-button.danger { color: #a14f4f; }
+.icon-button.danger:hover { border-color: #e5caca; background: #fff4f3; }
+.contribution-empty { grid-column: 1 / -1; min-height: 240px; border: 1px dashed #d9dfd9; border-radius: 11px; background: #fbfcfa; }
+.contribution-empty .primary-button { margin-top: 7px; }
+.repo.contribution-repo span small { display: block; max-width: 150px; margin-top: 2px; overflow: hidden; color: #929991; font: 7px 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
+.detail-empty { color: #929992; font-size: 9px; }
 .path-copy { min-width: 0; height: 34px; border: 1px solid #e0e3df; border-radius: 7px; background: #f8f9f7; display: flex; align-items: center; justify-content: space-between; padding: 0 9px; color: #6d756e; cursor: pointer; }
 .path-copy code { overflow: hidden; text-overflow: ellipsis; font: 9px 'DM Mono', monospace; }
 .guardrail { min-height: 78px; margin-bottom: 16px; padding: 0 18px; background: #eaf3ed; border: 1px solid #d5e7da; border-radius: 11px; display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 12px; color: #3f6e50; }

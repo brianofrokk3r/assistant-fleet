@@ -9,6 +9,8 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test shared/*.test.ts",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:live": "FLEET_E2E_LIVE_REMOTE=true npm run test:e2e -- --grep @live",
     "preview": "vite preview --host 0.0.0.0",
     "start": "node --experimental-strip-types server/index.ts"
   },
@@ -20,6 +22,7 @@
     "vite": "latest"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/node": "^26.6.4",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",

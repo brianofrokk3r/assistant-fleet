@@ -13,7 +13,7 @@ RUN npm run typecheck && npm run build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 
-RUN apk add --no-cache docker-cli docker-cli-compose tini
+RUN apk add --no-cache docker-cli docker-cli-compose git openssh-client tini
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

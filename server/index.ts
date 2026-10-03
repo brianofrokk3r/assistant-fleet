@@ -1,19 +1,24 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, rename, stat, writeFile, readdir, unlink } from 'node:fs/promises';
+import { chmod, chown, lstat, mkdir, readFile, rename, stat, writeFile, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   deploymentFromConfiguration,
+  validateContributionRepository,
   validateTenantConfiguration,
   type ActivityRecord,
+  type Contribution,
+  type ContributionRepository,
+  type ContributionRepositoryInput,
   type Deployment,
   type FleetState,
   type OperationResult,
   type RepositorySnapshot,
   type TenantConfiguration,
 } from '../shared/types.ts';
+import { ContributionError, ContributionRuntime } from './contributions.ts';
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(process.env.FLEET_ROOT || path.join(moduleDir, '..'));
@@ -27,9 +32,10 @@ const port = Number(process.env.FLEET_PORT || 8080);
 const bindHost = process.env.FLEET_BIND_HOST || '127.0.0.1';
 const serveStatic = process.env.FLEET_SERVE_STATIC !== 'false';
 const dockerEnabled = process.env.FLEET_DOCKER_ENABLED !== 'false';
+const allowLocalContributionRemotes = process.env.FLEET_E2E_ALLOW_LOCAL_REMOTES === 'true';
 const maxOutputBytes = 512_000;
 
-const emptyState = (): FleetState => ({ deployments: [], activities: [] });
+const emptyState = (): FleetState => ({ deployments: [], activities: [], contributionRepositories: [], contributions: [] });
 
 async function ensureLayout(): Promise<void> {
   await Promise.all([dataDir, tenantsDir, skillsetsDir, snapshotsDir].map(directory => mkdir(directory, { recursive: true })));
@@ -39,7 +45,12 @@ async function readState(): Promise<FleetState> {
   await ensureLayout();
   try {
     const parsed = JSON.parse(await readFile(stateFile, 'utf8')) as FleetState;
-    return { deployments: Array.isArray(parsed.deployments) ? parsed.deployments : [], activities: Array.isArray(parsed.activities) ? parsed.activities : [] };
+    return {
+      deployments: Array.isArray(parsed.deployments) ? parsed.deployments : [],
+      activities: Array.isArray(parsed.activities) ? parsed.activities : [],
+      contributionRepositories: Array.isArray(parsed.contributionRepositories) ? parsed.contributionRepositories : [],
+      contributions: Array.isArray(parsed.contributions) ? parsed.contributions : [],
+    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyState();
     throw error;
@@ -88,6 +99,11 @@ async function resolveSecret(reference: string): Promise<{ variable: string; val
   if (!value) throw new Error(`Secret reference ${reference} is unresolved. Set ${variable} or provide the referenced file.`);
   return { variable, value };
 }
+
+const contributionRuntime = new ContributionRuntime({ tenantsDir, resolveSecret });
+const contributionBrokers = new Map<string, ReturnType<typeof createServer>>();
+const contributionQueueTimers = new Map<string, ReturnType<typeof setInterval>>();
+const contributionQueueBusy = new Set<string>();
 
 function providerSecretEnvironment(config: TenantConfiguration): string {
   if (config.providerSecretEnvName) return config.providerSecretEnvName;
@@ -160,7 +176,64 @@ function placeholder(variable: string, message: string): string {
   return `\${${variable}:?${message}}`;
 }
 
-async function renderTenant(deployment: Deployment): Promise<string> {
+function assignedContributionRepositories(deployment: Deployment, repositories: ContributionRepository[]): ContributionRepository[] {
+  return repositories.filter(repository => repository.enabled && repository.assignedTenants.includes(deployment.id));
+}
+
+async function renderContributionSkill(skillDir: string, repositories: ContributionRepository[]): Promise<void> {
+  if (!repositories.length) return;
+  const directory = path.join(skillDir, 'fleet-contribute');
+  await mkdir(directory, { recursive: true });
+  const aliases = repositories.map(repository => `- \`${repository.alias}\` (base \`${repository.defaultBranch}\`, branches \`${repository.branchPrefix}*\`)`).join('\n');
+  const skill = `---
+name: fleet-contribute
+description: Inspect or change repositories assigned by Assistant Fleet using isolated checkouts and brokered contribution-branch publishing.
+---
+
+# Fleet contribution workflow
+
+Use this skill whenever a user asks you to inspect or change an assigned contribution repository. Do not claim that a repository is unavailable before running \`fleet-contribute list\`.
+
+Assigned repositories:
+${aliases}
+
+## Workflow
+
+1. Run \`fleet-contribute list\`.
+2. Run \`fleet-contribute prepare <alias>\`. The response contains the isolated \`workspacePath\`, contribution ID, generated branch, and pinned \`baseSha\`.
+3. Inspect, edit, and test only inside that exact workspace path.
+4. Review the diff and run checks appropriate to the repository and change.
+5. For a requested repository change, publish the validated result with \`fleet-contribute publish <id> --base <baseSha> --message "<message>"\`, unless the user explicitly requested local-only work, no push, or confirmation before publishing.
+6. Report the pushed branch and pull-request handoff URL. This workflow creates neither the pull request nor a merge.
+
+## Publishing boundary
+
+A request to implement or change the assigned repository authorizes pushing only the generated contribution branch through \`fleet-contribute publish\`. It does not authorize pushing another branch, creating or merging a pull request, or making unrelated external changes.
+
+\`fleet-contribute publish\` delegates the authenticated push to the Fleet controller. A Slack session, a sandbox without direct network access, or an agent approval mode such as \`never\` does not disable this brokered command. Attempt the command and rely on its actual result. Do not claim that external publishing is disabled unless the command itself returns that error.
+
+If publishing fails, do not claim that a remote branch or pull request exists. Report the exact error and preserve the contribution for a later retry; do not repeatedly retry without new evidence that the failure condition changed.
+
+Never read or request repository credentials. Never change the generated branch, base SHA, Git remote, hooks, protected paths, or files outside the isolated checkout.
+`;
+  await writeFile(path.join(directory, 'SKILL.md'), skill, { mode: 0o644 });
+}
+
+async function renderContributionPrompt(promptFile: string, repositories: ContributionRepository[]): Promise<void> {
+  const start = '<!-- assistant-fleet:contributions:start -->';
+  const end = '<!-- assistant-fleet:contributions:end -->';
+  const current = await readFile(promptFile, 'utf8');
+  const withoutManagedSection = current.replace(new RegExp(`\\n?${start}[\\s\\S]*?${end}\\n?`, 'g'), '').trimEnd();
+  if (!repositories.length) {
+    if (withoutManagedSection !== current.trimEnd()) await writeFile(promptFile, `${withoutManagedSection}\n`, { mode: 0o644 });
+    return;
+  }
+  const aliases = repositories.map(repository => `\`${repository.alias}\``).join(', ');
+  const managedSection = `${start}\n## Contribution repositories\n\nAssigned aliases: ${aliases}.\n\nWhen a user asks you to inspect or change an assigned repository, use the \`fleet-contribute\` skill. Run \`fleet-contribute list\` and then \`fleet-contribute prepare <alias>\` before inspecting files. The alias directory under \`/data/workspaces/contributions\` is only a parent directory and is not itself a Git checkout. An empty parent directory does not mean repository access is unavailable. Use the exact \`workspacePath\`, contribution ID, generated branch, and base SHA returned by \`prepare\`.\n\nFor a requested repository change, completion includes publishing the validated generated branch with \`fleet-contribute publish\` and returning its pull-request handoff URL, unless the user explicitly requests local-only work, no push, or confirmation first. Publishing is brokered by Fleet; do not infer that it is disabled merely because the Slack/Codex sandbox lacks direct external network access. The workflow does not create or merge a pull request.\n${end}`;
+  await writeFile(promptFile, `${withoutManagedSection}\n\n${managedSection}\n`, { mode: 0o644 });
+}
+
+async function renderTenant(deployment: Deployment, contributionRepositories: ContributionRepository[] = []): Promise<string> {
   const config = deployment.configuration;
   if (!config) throw new Error('Deployment has no typed tenant configuration.');
   const validation = validateTenantConfiguration(config);
@@ -172,6 +245,30 @@ async function renderTenant(deployment: Deployment): Promise<string> {
   try { await stat(promptFile); } catch { await writeFile(promptFile, `# ${deployment.name} assistant\n\nAnswer with evidence from the tenant's authorized workspace.\n`, { mode: 0o644 }); }
 
   const environment = composeEnvironment(config);
+  const assignedRepositories = assignedContributionRepositories(deployment, contributionRepositories);
+  await renderContributionPrompt(promptFile, assignedRepositories);
+  if (assignedRepositories.length) {
+    await ensureContributionBroker(deployment.id);
+    environment.FLEET_CONTRIBUTION_SOCKET = '/data/workspaces/.fleet-contribution/broker.sock';
+    environment.FLEET_CONTRIBUTION_QUEUE = '/data/workspaces/.fleet-contribution';
+    environment.FLEET_CONTRIBUTION_REPOSITORIES = JSON.stringify(assignedRepositories.map(repository => ({
+      id: repository.id,
+      alias: repository.alias,
+      provider: repository.provider,
+      remote: repository.remote,
+      defaultBranch: repository.defaultBranch,
+      credentialRef: repository.credentialRef,
+      branchPrefix: repository.branchPrefix,
+    })));
+    const contributionWorkspace = path.join(tenantDir, 'workspace', 'contributions');
+    await mkdir(contributionWorkspace, { recursive: true, mode: 0o775 });
+    try { if (process.getuid?.() === 0) await chown(contributionWorkspace, 10001, 10001); }
+    catch (error) {
+      if (!['EPERM', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      await chmod(contributionWorkspace, 0o777);
+    }
+    await renderContributionSkill(skillDir, assignedRepositories);
+  }
   if (config.type === 'slack') {
     environment.SLACK_APP_TOKEN = placeholder(secretVariableName(config.slackAppTokenRef), 'Slack app token is required');
     environment.SLACK_BOT_TOKEN = placeholder(secretVariableName(config.slackBotTokenRef), 'Slack bot token is required');
@@ -194,7 +291,13 @@ async function renderTenant(deployment: Deployment): Promise<string> {
   const skillTarget = config.provider === 'codex' ? '/data/.codex/skills' : '/data/.agents/skills';
   const skillSource = path.relative(tenantDir, skillDir);
   const initializeData = `mkdir -p /data/.codex /data/.agents ${skillTarget} /data/workspaces && cp -R /managed-skills/. ${skillTarget}/ && chown -R 10001:10001 /data/.codex /data/.agents /data/workspaces && chown 10001:10001 /data`;
-  const workspaceVolume = config.managedWorkspace ? `      - ${yaml('./workspace:/data/workspaces')}` : '';
+  const managedWorkspaceVolume = config.managedWorkspace ? `      - ${yaml('./workspace:/data/workspaces')}` : '';
+  const contributionVolumes = assignedRepositories.length ? [
+    `      - ${yaml('./workspace/contributions:/data/workspaces/contributions')}`,
+    `      - ${yaml('./workspace/.fleet-contribution:/data/workspaces/.fleet-contribution')}`,
+    `      - ${yaml('../../runtime/fleet-contribute.mjs:/usr/local/bin/fleet-contribute:ro')}`,
+  ].join('\n') : '';
+  const workspaceVolume = [managedWorkspaceVolume, contributionVolumes].filter(Boolean).join('\n');
   const relay = config.n8nRelay?.enabled ? `\n  n8n-relay:\n    image: ${yaml(config.image)}\n    entrypoint: ["node", "/app/dist/src/n8nIntakeRelay.js"]\n    restart: unless-stopped\n    init: true\n    environment:\n      N8N_INTAKE_ROOT: /content/content/marketing\n      N8N_INTAKE_URL: ${yaml(config.n8nRelay.intakeUrl)}\n      N8N_INTAKE_TOKEN: ${yaml(placeholder(secretVariableName(config.n8nRelay.intakeTokenRef), 'n8n intake token is required'))}\n      N8N_INTAKE_HEADER_NAME: ${yaml(config.n8nRelay.headerName)}\n      N8N_INTAKE_POLL_MS: ${yaml(config.n8nRelay.pollMs)}\n    volumes:\n      - ${yaml('./workspace:/content')}\n    read_only: true\n    tmpfs:\n      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001\n    cap_drop: [ALL]\n    security_opt:\n      - no-new-privileges:true\n      - seccomp=../../runtime/seccomp.json\n    pids_limit: 32\n    networks:\n      - default\n` : '';
   const volumeDefinition = config.dataVolumeName
     ? `  assistant-data:\n    external: true\n    name: ${yaml(config.dataVolumeName)}`
@@ -240,7 +343,8 @@ async function runCommand(command: string, args: string[], options: { cwd: strin
 async function runCompose(deployment: Deployment, args: string[], timeoutMs?: number): Promise<CommandResult> {
   if (!dockerEnabled) throw new Error('Docker operations are disabled by FLEET_DOCKER_ENABLED=false.');
   const tenantDir = path.join(tenantsDir, deployment.id);
-  await renderTenant(deployment);
+  const state = await readState();
+  await renderTenant(deployment, state.contributionRepositories);
   const env = await composeSecrets(deployment);
   const result = await runCommand('docker', ['compose', '--project-name', deployment.project, '--file', 'compose.generated.yaml', ...args], { cwd: tenantDir, env, timeoutMs });
   if (result.code !== 0) throw new Error((result.stderr || result.stdout || `Docker Compose exited with ${result.code}`).trim());
@@ -249,6 +353,207 @@ async function runCompose(deployment: Deployment, args: string[], timeoutMs?: nu
 
 function activity(kind: ActivityRecord['kind'], tone: ActivityRecord['tone'], title: string, detail: string, deploymentId?: string): ActivityRecord {
   return { id: crypto.randomUUID(), kind, tone, title, detail, deploymentId, createdAt: new Date().toISOString() };
+}
+
+function assignedRepository(state: FleetState, tenantId: string, selector: string): ContributionRepository {
+  const repository = state.contributionRepositories.find(item => item.id === selector || item.alias === selector);
+  if (!repository || !repository.enabled || !repository.assignedTenants.includes(tenantId)) {
+    throw new ContributionError('Contribution repository is not enabled and assigned to this tenant.', 404);
+  }
+  return repository;
+}
+
+async function prepareContribution(tenantId: string, selector: string, requestId: string): Promise<{ contribution: Contribution; created: boolean }> {
+  let state = await readState();
+  if (!state.deployments.some(deployment => deployment.id === tenantId)) throw new ContributionError('Deployment not found.', 404);
+  let repository = assignedRepository(state, tenantId, selector);
+  return await contributionRuntime.locked(repository.id, async () => {
+    state = await readState();
+    repository = assignedRepository(state, tenantId, selector);
+    const existing = state.contributions.find(item => item.tenantId === tenantId && item.repositoryId === repository.id && item.requestId === requestId);
+    if (existing) return { contribution: existing, created: false };
+    const contribution = await contributionRuntime.prepare(tenantId, repository, requestId);
+    state.contributions.push(contribution);
+    state.activities.unshift(activity('contribution', 'blue', `${repository.alias} contribution prepared`, contribution.branch, tenantId));
+    state.activities = state.activities.slice(0, 500);
+    await writeState(state);
+    return { contribution, created: true };
+  });
+}
+
+async function publishContribution(tenantId: string, contributionId: string, input: { expectedBaseSha: string; message: string; branch?: string }): Promise<Contribution> {
+  let state = await readState();
+  const initial = state.contributions.find(item => item.id === contributionId && item.tenantId === tenantId);
+  if (!initial) throw new ContributionError('Contribution not found.', 404);
+  return await contributionRuntime.locked(initial.repositoryId, async () => {
+    state = await readState();
+    const index = state.contributions.findIndex(item => item.id === contributionId && item.tenantId === tenantId);
+    if (index < 0) throw new ContributionError('Contribution not found.', 404);
+    const current = state.contributions[index];
+    const repository = assignedRepository(state, tenantId, current.repositoryId);
+    const published = await contributionRuntime.publish(current, repository, input);
+    state.contributions[index] = published;
+    state.activities.unshift(activity('contribution', 'green', `${repository.alias} contribution published`, published.branch, tenantId));
+    state.activities = state.activities.slice(0, 500);
+    await writeState(state);
+    return published;
+  });
+}
+
+async function abortContribution(tenantId: string, contributionId: string): Promise<Contribution> {
+  const state = await readState();
+  const index = state.contributions.findIndex(item => item.id === contributionId && item.tenantId === tenantId);
+  if (index < 0) throw new ContributionError('Contribution not found.', 404);
+  const aborted = await contributionRuntime.abort(state.contributions[index]);
+  state.contributions[index] = aborted;
+  state.activities.unshift(activity('contribution', 'amber', `${aborted.repositoryAlias} contribution aborted`, aborted.branch, tenantId));
+  await writeState(state);
+  return aborted;
+}
+
+function contributionErrorStatus(error: unknown): number {
+  return error instanceof ContributionError ? error.statusCode : 500;
+}
+
+interface ContributionBrokerResult { statusCode: number; body: unknown }
+
+async function executeContributionBrokerRequest(tenantId: string, method: string, pathname: string, rawBody: unknown = {}): Promise<ContributionBrokerResult> {
+  const body = rawBody && typeof rawBody === 'object' ? rawBody as Record<string, unknown> : {};
+  if (method === 'GET' && pathname === '/repositories') {
+    const state = await readState();
+    const repositories = state.contributionRepositories
+      .filter(repository => repository.enabled && repository.assignedTenants.includes(tenantId))
+      .map(({ credentialRef: _credentialRef, ...repository }) => repository);
+    return { statusCode: 200, body: { repositories } };
+  }
+  if (method === 'POST' && pathname === '/prepare') {
+    const result = await prepareContribution(tenantId, typeof body.repository === 'string' ? body.repository : '', typeof body.requestId === 'string' ? body.requestId : '');
+    return { statusCode: result.created ? 201 : 200, body: { contribution: result.contribution } };
+  }
+  if (method === 'GET' && pathname === '/contributions') {
+    const state = await readState();
+    return { statusCode: 200, body: { contributions: state.contributions.filter(item => item.tenantId === tenantId) } };
+  }
+  const match = pathname.match(/^\/contributions\/([a-f0-9-]+)(?:\/(publish|abort))?$/);
+  if (match && method === 'GET' && !match[2]) {
+    const state = await readState();
+    const contribution = state.contributions.find(item => item.id === match[1] && item.tenantId === tenantId);
+    if (!contribution) throw new ContributionError('Contribution not found.', 404);
+    return { statusCode: 200, body: { contribution } };
+  }
+  if (match && method === 'POST' && match[2] === 'publish') {
+    const contribution = await publishContribution(tenantId, match[1], {
+      expectedBaseSha: typeof body.expectedBaseSha === 'string' ? body.expectedBaseSha : '',
+      message: typeof body.message === 'string' ? body.message : '',
+      branch: typeof body.branch === 'string' ? body.branch : undefined,
+    });
+    return { statusCode: 200, body: { contribution } };
+  }
+  if (match && method === 'POST' && match[2] === 'abort') {
+    return { statusCode: 200, body: { contribution: await abortContribution(tenantId, match[1]) } };
+  }
+  return { statusCode: 404, body: { error: 'Contribution broker route not found.' } };
+}
+
+async function handleContributionBroker(tenantId: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  try {
+    const url = new URL(request.url || '/', 'http://localhost');
+    const body = request.method === 'POST' ? await parseBody(request) : {};
+    const result = await executeContributionBrokerRequest(tenantId, request.method ?? 'GET', url.pathname, body);
+    return sendJson(response, result.statusCode, result.body);
+  } catch (error) {
+    return sendJson(response, contributionErrorStatus(error), { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function processContributionQueue(tenantId: string, directory: string): Promise<void> {
+  if (contributionQueueBusy.has(tenantId)) return;
+  contributionQueueBusy.add(tenantId);
+  try {
+    const requestsDir = path.join(directory, 'requests');
+    const responsesDir = path.join(directory, 'responses');
+    for (const name of (await readdir(requestsDir)).filter(item => /^[a-f0-9-]+\.json$/.test(item)).sort()) {
+      const requestFile = path.join(requestsDir, name);
+      const responseFile = path.join(responsesDir, name);
+      let result: ContributionBrokerResult;
+      try {
+        const info = await lstat(requestFile);
+        if (!info.isFile() || info.isSymbolicLink() || info.size > 64_000) throw new ContributionError('Invalid contribution queue request.');
+        const request = JSON.parse(await readFile(requestFile, 'utf8')) as { version?: number; method?: string; pathname?: string; body?: unknown };
+        if (request.version !== 1 || !['GET', 'POST'].includes(request.method ?? '') || typeof request.pathname !== 'string') {
+          throw new ContributionError('Invalid contribution queue request.');
+        }
+        result = await executeContributionBrokerRequest(tenantId, request.method!, request.pathname, request.body);
+      } catch (error) {
+        result = { statusCode: contributionErrorStatus(error), body: { error: error instanceof Error ? error.message : String(error) } };
+      }
+      const temporary = `${responseFile}.${process.pid}.tmp`;
+      await writeFile(temporary, JSON.stringify(result), { mode: 0o666 });
+      await rename(temporary, responseFile);
+      await unlink(requestFile);
+    }
+  } finally {
+    contributionQueueBusy.delete(tenantId);
+  }
+}
+
+async function ensureContributionBroker(tenantId: string): Promise<void> {
+  if (contributionBrokers.has(tenantId)) return;
+  const directory = path.join(tenantsDir, tenantId, 'workspace', '.fleet-contribution');
+  const socketPath = path.join(directory, 'broker.sock');
+  await mkdir(directory, { recursive: true, mode: 0o775 });
+  try { if (process.getuid?.() === 0) await chown(directory, 10001, 10001); }
+  catch (error) { if (!['EPERM', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error; }
+  const requestsDir = path.join(directory, 'requests');
+  const responsesDir = path.join(directory, 'responses');
+  await Promise.all([mkdir(requestsDir, { recursive: true, mode: 0o777 }), mkdir(responsesDir, { recursive: true, mode: 0o777 })]);
+  await Promise.all([chmod(requestsDir, 0o777), chmod(responsesDir, 0o777)]);
+  try { await unlink(socketPath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const broker = createServer((request, response) => { void handleContributionBroker(tenantId, request, response); });
+  await new Promise<void>((resolve, reject) => {
+    broker.once('error', reject);
+    broker.listen(socketPath, () => { broker.off('error', reject); resolve(); });
+  });
+  let tenantOwned = false;
+  try { if (process.getuid?.() === 0) { await chown(socketPath, 10001, 10001); tenantOwned = true; } }
+  catch (error) { if (!['EPERM', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error; }
+  await chmod(socketPath, tenantOwned ? 0o660 : 0o666);
+  contributionBrokers.set(tenantId, broker);
+  if (!contributionQueueTimers.has(tenantId)) {
+    const timer = setInterval(() => { void processContributionQueue(tenantId, directory); }, 100);
+    timer.unref();
+    contributionQueueTimers.set(tenantId, timer);
+  }
+}
+
+function normalizeContributionRepository(input: ContributionRepositoryInput): ContributionRepositoryInput {
+  return {
+    alias: input.alias.trim(),
+    provider: input.provider,
+    remote: input.remote.trim(),
+    defaultBranch: input.defaultBranch.trim(),
+    credentialRef: input.credentialRef.trim(),
+    authorName: input.authorName.trim(),
+    authorEmail: input.authorEmail.trim(),
+    branchPrefix: input.branchPrefix.trim(),
+    assignedTenants: [...new Set(input.assignedTenants)],
+    protectedPaths: [...new Set(input.protectedPaths.map(item => item.trim()))],
+    maxChangedFiles: input.maxChangedFiles,
+    maxChangedBytes: input.maxChangedBytes,
+    enabled: input.enabled,
+  };
+}
+
+function contributionRepositoryAssignmentErrors(input: ContributionRepositoryInput, state: FleetState): string[] {
+  const deploymentIds = new Set(state.deployments.map(deployment => deployment.id));
+  return input.assignedTenants.filter(id => !deploymentIds.has(id)).map(id => `Assigned tenant does not exist: ${id}`);
+}
+
+async function renderContributionAssignments(state: FleetState, tenantIds: Iterable<string>): Promise<void> {
+  const ids = new Set(tenantIds);
+  await Promise.all(state.deployments
+    .filter(deployment => ids.has(deployment.id))
+    .map(deployment => renderTenant(deployment, state.contributionRepositories)));
 }
 
 async function recordRevision(deployment: Deployment): Promise<void> {
@@ -333,6 +638,63 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
   if (request.method === 'GET' && url.pathname === '/api/health') return sendJson(response, 200, { ok: true, dockerEnabled, root: projectRoot });
   if (request.method === 'GET' && (url.pathname === '/api/state' || url.pathname === '/api/deployments')) return sendJson(response, 200, await readState());
 
+  if (request.method === 'GET' && url.pathname === '/api/contribution-repositories') {
+    const state = await readState();
+    return sendJson(response, 200, { repositories: state.contributionRepositories });
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/contribution-repositories') {
+    const body = await parseBody(request);
+    const validation = validateContributionRepository(body, allowLocalContributionRemotes);
+    if (!validation.valid) return sendJson(response, 422, { error: 'Invalid contribution repository.', errors: validation.errors });
+    const input = normalizeContributionRepository(body as ContributionRepositoryInput);
+    const state = await readState();
+    const assignmentErrors = contributionRepositoryAssignmentErrors(input, state);
+    if (assignmentErrors.length) return sendJson(response, 422, { error: 'Invalid tenant assignments.', errors: assignmentErrors });
+    if (state.contributionRepositories.some(repository => repository.alias === input.alias)) {
+      return sendJson(response, 409, { error: `A contribution repository with alias ${input.alias} already exists.` });
+    }
+    const now = new Date().toISOString();
+    const repository: ContributionRepository = { ...input, id: crypto.randomUUID(), createdAt: now, updatedAt: now };
+    state.contributionRepositories.push(repository);
+    state.activities.unshift(activity('contribution-repository', 'blue', `${repository.alias} registered`, `${repository.provider} · ${repository.assignedTenants.length} tenant assignments`));
+    await renderContributionAssignments(state, repository.assignedTenants);
+    await writeState(state);
+    return sendJson(response, 201, { repository });
+  }
+
+  const contributionMatch = url.pathname.match(/^\/api\/contribution-repositories\/([a-f0-9-]+)$/);
+  if (contributionMatch) {
+    const state = await readState();
+    const repositoryIndex = state.contributionRepositories.findIndex(repository => repository.id === contributionMatch[1]);
+    if (repositoryIndex < 0) return sendJson(response, 404, { error: 'Contribution repository not found.' });
+    const previous = state.contributionRepositories[repositoryIndex];
+    if (request.method === 'PUT') {
+      const body = await parseBody(request);
+      const validation = validateContributionRepository(body, allowLocalContributionRemotes);
+      if (!validation.valid) return sendJson(response, 422, { error: 'Invalid contribution repository.', errors: validation.errors });
+      const input = normalizeContributionRepository(body as ContributionRepositoryInput);
+      const assignmentErrors = contributionRepositoryAssignmentErrors(input, state);
+      if (assignmentErrors.length) return sendJson(response, 422, { error: 'Invalid tenant assignments.', errors: assignmentErrors });
+      if (state.contributionRepositories.some((repository, index) => index !== repositoryIndex && repository.alias === input.alias)) {
+        return sendJson(response, 409, { error: `A contribution repository with alias ${input.alias} already exists.` });
+      }
+      const repository: ContributionRepository = { ...previous, ...input, updatedAt: new Date().toISOString() };
+      state.contributionRepositories[repositoryIndex] = repository;
+      state.activities.unshift(activity('contribution-repository', 'blue', `${repository.alias} updated`, `${repository.provider} · ${repository.assignedTenants.length} tenant assignments`));
+      await renderContributionAssignments(state, [...previous.assignedTenants, ...repository.assignedTenants]);
+      await writeState(state);
+      return sendJson(response, 200, { repository });
+    }
+    if (request.method === 'DELETE') {
+      state.contributionRepositories.splice(repositoryIndex, 1);
+      state.activities.unshift(activity('contribution-repository', 'amber', `${previous.alias} removed`, `${previous.provider} contribution access removed`));
+      await renderContributionAssignments(state, previous.assignedTenants);
+      await writeState(state);
+      return sendJson(response, 200, { repository: previous });
+    }
+  }
+
   if (request.method === 'POST' && url.pathname === '/api/deployments') {
     const body = await parseBody(request);
     const validation = validateTenantConfiguration(body);
@@ -341,7 +703,7 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
     const state = await readState();
     if (state.deployments.some(item => item.id === config.slug)) return sendJson(response, 409, { error: 'A deployment with this slug already exists.' });
     const deployment = deploymentFromConfiguration(config);
-    await renderTenant(deployment);
+    await renderTenant(deployment, state.contributionRepositories);
     state.deployments.push(deployment);
     state.activities.unshift(activity('created', 'blue', `${deployment.name} created`, `${deployment.adapter} · ${deployment.provider}`, deployment.id));
     await writeState(state);
@@ -354,6 +716,41 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
   const state = await readState();
   const index = state.deployments.findIndex(item => item.id === id);
   if (index < 0) return sendJson(response, 404, { error: 'Deployment not found.' });
+
+  if (request.method === 'POST' && suffix === 'contributions/prepare') {
+    try {
+      const body = await parseBody(request) as { repositoryId?: string; repository?: string; requestId?: string };
+      const result = await prepareContribution(id, body.repositoryId ?? body.repository ?? '', body.requestId ?? '');
+      return sendJson(response, result.created ? 201 : 200, { contribution: result.contribution });
+    } catch (error) {
+      return sendJson(response, contributionErrorStatus(error), { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (request.method === 'GET' && suffix === 'contributions') {
+    return sendJson(response, 200, { contributions: state.contributions.filter(item => item.tenantId === id) });
+  }
+  const contributionAction = suffix.match(/^contributions\/([a-f0-9-]+)(?:\/(publish|abort))?$/);
+  if (contributionAction && request.method === 'GET' && !contributionAction[2]) {
+    const contribution = state.contributions.find(item => item.id === contributionAction[1] && item.tenantId === id);
+    return contribution ? sendJson(response, 200, { contribution }) : sendJson(response, 404, { error: 'Contribution not found.' });
+  }
+  if (contributionAction && request.method === 'POST' && contributionAction[2] === 'publish') {
+    try {
+      const body = await parseBody(request) as { expectedBaseSha?: string; message?: string; branch?: string };
+      const contribution = await publishContribution(id, contributionAction[1], { expectedBaseSha: body.expectedBaseSha ?? '', message: body.message ?? '', branch: body.branch });
+      return sendJson(response, 200, { contribution });
+    } catch (error) {
+      return sendJson(response, contributionErrorStatus(error), { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (contributionAction && request.method === 'POST' && contributionAction[2] === 'abort') {
+    try {
+      await parseBody(request);
+      return sendJson(response, 200, { contribution: await abortContribution(id, contributionAction[1]) });
+    } catch (error) {
+      return sendJson(response, contributionErrorStatus(error), { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
 
   if (request.method === 'PUT' && suffix === '') {
     const body = await parseBody(request);
@@ -372,7 +769,7 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
       storage: previous.storage,
       updated: 'Just now',
     } satisfies Deployment;
-    await renderTenant(updated);
+    await renderTenant(updated, state.contributionRepositories);
     state.deployments[index] = updated;
     state.activities.unshift(activity('updated', 'blue', `${updated.name} configuration updated`, `${updated.adapter} · ${updated.provider}`, id));
     await writeState(state);
@@ -380,7 +777,7 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
   }
 
   if (request.method === 'GET' && suffix === 'compose') {
-    const compose = await renderTenant(state.deployments[index]);
+    const compose = await renderTenant(state.deployments[index], state.contributionRepositories);
     response.writeHead(200, { 'content-type': 'text/yaml; charset=utf-8', 'cache-control': 'no-store' });
     response.end(compose);
     return;
@@ -403,7 +800,7 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
     await recordRevision(state.deployments[index]);
     const repository: RepositorySnapshot = { name: body.name, revision: body.revision };
     state.deployments[index] = { ...state.deployments[index], repositoryList: [...state.deployments[index].repositoryList.filter(item => item.name !== repository.name), repository], updated: 'Just now' };
-    await renderTenant(state.deployments[index]);
+    await renderTenant(state.deployments[index], state.contributionRepositories);
     state.activities.unshift(activity('repository', 'blue', `${repository.name} mounted`, `${id} · ${repository.revision}`, id));
     await writeState(state);
     return sendJson(response, 200, { deployment: state.deployments[index] });
@@ -430,6 +827,10 @@ async function serveAsset(response: ServerResponse, pathname: string): Promise<v
 }
 
 await ensureLayout();
+const startupState = await readState();
+await Promise.all(startupState.deployments
+  .filter(deployment => assignedContributionRepositories(deployment, startupState.contributionRepositories).length > 0)
+  .map(deployment => ensureContributionBroker(deployment.id)));
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);

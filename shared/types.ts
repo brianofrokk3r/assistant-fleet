@@ -9,6 +9,52 @@ export interface RepositorySnapshot {
   revision: string;
 }
 
+export type ContributionRepositoryProvider = 'bitbucket-cloud' | 'github' | 'local';
+
+export interface ContributionRepository {
+  id: string;
+  alias: string;
+  provider: ContributionRepositoryProvider;
+  /** Provider identity (`owner/repository`) or an E2E-only absolute local path. */
+  remote: string;
+  defaultBranch: string;
+  credentialRef: string;
+  authorName: string;
+  authorEmail: string;
+  branchPrefix: string;
+  assignedTenants: string[];
+  protectedPaths: string[];
+  maxChangedFiles: number;
+  maxChangedBytes: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ContributionRepositoryInput = Omit<ContributionRepository, 'id' | 'createdAt' | 'updatedAt'>;
+
+export type ContributionStatus = 'prepared' | 'published' | 'aborted' | 'failed';
+
+export interface Contribution {
+  id: string;
+  requestId: string;
+  tenantId: string;
+  repositoryId: string;
+  repositoryAlias: string;
+  baseSha: string;
+  branch: string;
+  /** Path exposed to the tenant assistant, never the controller's host path. */
+  workspacePath: string;
+  status: ContributionStatus;
+  createdAt: string;
+  updatedAt: string;
+  publishedSha?: string;
+  branchUrl?: string;
+  pullRequestUrl?: string;
+  validationSummary?: string;
+  failureReason?: string;
+}
+
 export interface SecretEnvironmentVariable {
   name: string;
   reference: string;
@@ -122,7 +168,7 @@ export type ActivityTone = 'green' | 'blue' | 'amber';
 
 export interface ActivityRecord {
   id: string;
-  kind: 'created' | 'updated' | 'deploy' | 'suspend' | 'resume' | 'verify' | 'rollback' | 'repository' | 'error';
+  kind: 'created' | 'updated' | 'deploy' | 'suspend' | 'resume' | 'verify' | 'rollback' | 'repository' | 'contribution-repository' | 'contribution' | 'error';
   tone: ActivityTone;
   title: string;
   detail: string;
@@ -133,6 +179,8 @@ export interface ActivityRecord {
 export interface FleetState {
   deployments: Deployment[];
   activities: ActivityRecord[];
+  contributionRepositories: ContributionRepository[];
+  contributions: Contribution[];
 }
 
 export interface OperationResult {
@@ -146,6 +194,57 @@ export interface OperationResult {
 export interface ValidationResult {
   valid: boolean;
   errors: string[];
+}
+
+export function validateContributionRepository(value: unknown, allowLocal = false): ValidationResult {
+  const errors: string[] = [];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { valid: false, errors: ['Contribution repository must be an object.'] };
+  }
+  const repository = value as Partial<ContributionRepositoryInput>;
+  if (typeof repository.alias !== 'string' || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(repository.alias)) {
+    errors.push('Alias must contain lowercase letters, numbers, and hyphens only.');
+  }
+  if (!['bitbucket-cloud', 'github', ...(allowLocal ? ['local'] : [])].includes(repository.provider ?? '')) {
+    errors.push('Provider must be Bitbucket Cloud or GitHub.');
+  }
+  if (repository.provider === 'local') {
+    if (!allowLocal || typeof repository.remote !== 'string' || !pathLikeAbsolute(repository.remote)) errors.push('Local remotes are available only to the E2E harness.');
+  } else if (typeof repository.remote !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository.remote)) {
+    errors.push('Repository must use the owner/repository form without a URL or credentials.');
+  }
+  if (typeof repository.defaultBranch !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(repository.defaultBranch)
+    || repository.defaultBranch.includes('..') || repository.defaultBranch.endsWith('/')) {
+    errors.push('Default branch is invalid.');
+  }
+  if (typeof repository.branchPrefix !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]*\/$/.test(repository.branchPrefix)
+    || repository.branchPrefix.includes('..') || ['main/', 'master/'].includes(repository.branchPrefix)) {
+    errors.push('Branch prefix must be a safe namespace ending in /.');
+  }
+  if (typeof repository.credentialRef !== 'string'
+    || (repository.provider !== 'local' && !/^(secret|env|file):\/\//.test(repository.credentialRef))) {
+    errors.push('Credential reference must use secret://, env://, or file://.');
+  }
+  if (typeof repository.authorName !== 'string' || !repository.authorName.trim()) errors.push('Commit author name is required.');
+  if (typeof repository.authorEmail !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(repository.authorEmail)) errors.push('Commit author email is invalid.');
+  if (!Array.isArray(repository.assignedTenants) || repository.assignedTenants.some(id => !/^[a-z0-9][a-z0-9-]*$/.test(id))) {
+    errors.push('Assigned tenants must be tenant slugs.');
+  }
+  if (!Array.isArray(repository.protectedPaths) || repository.protectedPaths.some(item => typeof item !== 'string' || !item.trim())) {
+    errors.push('Protected paths must be non-empty strings.');
+  }
+  if (!Number.isSafeInteger(repository.maxChangedFiles) || (repository.maxChangedFiles ?? 0) < 1 || (repository.maxChangedFiles ?? 0) > 500) {
+    errors.push('Maximum changed files must be between 1 and 500.');
+  }
+  if (!Number.isSafeInteger(repository.maxChangedBytes) || (repository.maxChangedBytes ?? 0) < 1 || (repository.maxChangedBytes ?? 0) > 50_000_000) {
+    errors.push('Maximum changed bytes must be between 1 and 50000000.');
+  }
+  if (typeof repository.enabled !== 'boolean') errors.push('Enabled must be true or false.');
+  return { valid: errors.length === 0, errors };
+}
+
+function pathLikeAbsolute(value: string): boolean {
+  return value.startsWith('/') && !value.includes('\0');
 }
 
 export function validateTenantConfiguration(value: unknown): ValidationResult {

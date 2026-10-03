@@ -1,4 +1,4 @@
-import type { ActivityRecord, Deployment, FleetState, OperationResult, RepositorySnapshot, TenantConfiguration } from '../shared/types';
+import type { ActivityRecord, ContributionRepository, ContributionRepositoryInput, Deployment, FleetState, OperationResult, RepositorySnapshot, TenantConfiguration } from '../shared/types';
 
 export class ApiError extends Error {
   status: number;
@@ -27,6 +27,10 @@ export const fleetApi = {
   createDeployment: (configuration: TenantConfiguration): Promise<{ deployment: Deployment }> => request('/api/deployments', { method: 'POST', body: JSON.stringify(configuration) }),
   updateDeployment: (id: string, configuration: TenantConfiguration): Promise<{ deployment: Deployment }> => request(`/api/deployments/${id}`, { method: 'PUT', body: JSON.stringify(configuration) }),
   addRepository: (id: string, repository: RepositorySnapshot): Promise<{ deployment: Deployment }> => request(`/api/deployments/${id}/repositories`, { method: 'POST', body: JSON.stringify(repository) }),
+  contributionRepositories: (): Promise<{ repositories: ContributionRepository[] }> => request('/api/contribution-repositories'),
+  createContributionRepository: (repository: ContributionRepositoryInput): Promise<{ repository: ContributionRepository }> => request('/api/contribution-repositories', { method: 'POST', body: JSON.stringify(repository) }),
+  updateContributionRepository: (id: string, repository: ContributionRepositoryInput): Promise<{ repository: ContributionRepository }> => request(`/api/contribution-repositories/${id}`, { method: 'PUT', body: JSON.stringify(repository) }),
+  deleteContributionRepository: (id: string): Promise<{ repository: ContributionRepository }> => request(`/api/contribution-repositories/${id}`, { method: 'DELETE' }),
   operate: (id: string, action: 'deploy' | 'suspend' | 'resume' | 'verify' | 'rollback'): Promise<OperationResult> => request(`/api/deployments/${id}/actions/${action}`, { method: 'POST', body: '{}' }),
   logs: (id: string): Promise<{ logs: string }> => request(`/api/deployments/${id}/logs`),
   composeUrl: (id: string): string => `/api/deployments/${id}/compose`,

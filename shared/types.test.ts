@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deploymentFromConfiguration, validateTenantConfiguration, type TenantConfiguration } from './types.ts';
+import { deploymentFromConfiguration, validateContributionRepository, validateTenantConfiguration, type ContributionRepositoryInput, type TenantConfiguration } from './types.ts';
 
 const base = (): TenantConfiguration => ({
   name: 'Acme', slug: 'acme', environment: 'Staging', type: 'slack',
@@ -64,4 +64,36 @@ test('migration-only secret references and sidecars remain typed and external', 
   };
   assert.equal(validateTenantConfiguration(config).valid, true);
   assert.equal(deploymentFromConfiguration(config).volume, 'legacy_assistant-data');
+});
+
+const contributionRepository = (): ContributionRepositoryInput => ({
+  alias: 'payments-api', provider: 'bitbucket-cloud', remote: 'acme/payments-api',
+  defaultBranch: 'main', credentialRef: 'secret://bitbucket/payments-api',
+  authorName: 'Assistant Fleet', authorEmail: 'assistant@example.invalid',
+  branchPrefix: 'assistant/', assignedTenants: ['acme'],
+  protectedPaths: ['.bitbucket/**'], maxChangedFiles: 30, maxChangedBytes: 1_000_000,
+  enabled: true,
+});
+
+test('contribution repositories support multiple tenant assignments', () => {
+  const repository = { ...contributionRepository(), assignedTenants: ['acme', 'northstar'] };
+  assert.equal(validateContributionRepository(repository).valid, true);
+});
+
+test('contribution repositories reject credential-bearing URLs and protected branch prefixes', () => {
+  const repository = {
+    ...contributionRepository(),
+    remote: 'https://token@bitbucket.org/acme/payments-api.git',
+    branchPrefix: 'main',
+  };
+  const validation = validateContributionRepository(repository);
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join(' '), /owner\/repository/);
+  assert.match(validation.errors.join(' '), /namespace ending in/);
+});
+
+test('local contribution remotes require the explicit E2E switch', () => {
+  const repository = { ...contributionRepository(), provider: 'local' as const, remote: '/tmp/fixture.git', credentialRef: '' };
+  assert.equal(validateContributionRepository(repository).valid, false);
+  assert.equal(validateContributionRepository(repository, true).valid, true);
 });

@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
-  Activity, Box, Check, ChevronDown, ChevronRight, CircleAlert,
+  Activity, ArchiveRestore, Box, Check, ChevronDown, ChevronRight, CircleAlert,
   Clock3, Copy, Database, Download, ExternalLink, FileText, FolderGit2, HardDrive, Hexagon,
-  Layers3, MoreHorizontal, Pause, Plus, RefreshCw, RotateCcw, Search,
-  Server, Settings, ShieldCheck, Sparkles, TerminalSquare, Users, X,
+  GitBranch, Layers3, MoreHorizontal, Pause, Pencil, Plus, RefreshCw, RotateCcw, Search,
+  Server, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2, Users, X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { type ActivityRecord, type AdapterType, type Deployment, type DeploymentStatus, type ProviderType, type RepositorySnapshot, type TenantConfiguration } from '../shared/types';
+import { type ActivityRecord, type AdapterType, type BackupSnapshot, type BackupStatus, type ContributionApproval, type ContributionRepository, type ContributionRepositoryInput, type Deployment, type DeploymentStatus, type ProviderType, type RepositorySnapshot, type TenantConfiguration } from '../shared/types';
 import { fleetApi } from './api';
 
 type PageName = 'deployments' | 'activity' | 'repositories' | 'access' | 'settings' | 'contract';
@@ -15,7 +15,7 @@ interface UIActivity { icon: LucideIcon; tone: ActivityTone; title: string; deta
 
 const activityIcon: Record<ActivityRecord['kind'], LucideIcon> = {
   created: Plus, updated: RefreshCw, deploy: Check, suspend: Pause, resume: Activity,
-  verify: ShieldCheck, rollback: RotateCcw, repository: FolderGit2, error: CircleAlert,
+  verify: ShieldCheck, rollback: RotateCcw, repository: FolderGit2, 'contribution-repository': GitBranch, contribution: GitBranch, error: CircleAlert,
 };
 
 function toUIActivity(record: ActivityRecord): UIActivity {
@@ -108,19 +108,85 @@ function Metric({ icon: Icon, value, label, tone }: { icon: LucideIcon; value: R
   );
 }
 
+function BackupPanel({ backup, snapshots, pending, onRun, onVerify, onRestore }: { backup: BackupStatus | null; snapshots: BackupSnapshot[]; pending: 'run' | 'verify' | 'restore' | null; onRun: () => void; onVerify: () => void; onRestore: (snapshotId: string) => void }) {
+  const safeSnapshots = snapshots.filter(snapshot => snapshot.restorable);
+  const [selectedId, setSelectedId] = useState('');
+  const selected = safeSnapshots.find(snapshot => snapshot.id === selectedId) ?? safeSnapshots[0];
+  const busy = pending !== null || backup?.state === 'running' || backup?.state === 'verifying' || backup?.state === 'restoring';
+  const available = backup?.containerState === 'running';
+  const tone = backup?.state === 'success' ? 'healthy' : backup?.state === 'running' || backup?.state === 'verifying' || backup?.state === 'restoring' ? 'deploying' : backup?.state === 'failed' ? 'attention' : 'suspended';
+  const label = backup?.state === 'success' ? 'Protected' : backup?.state === 'running' ? 'Backing up' : backup?.state === 'verifying' ? 'Verifying' : backup?.state === 'restoring' ? 'Restoring' : backup?.state === 'failed' ? 'Failed' : available ? 'Waiting' : 'Unavailable';
+  const formatTime = (value: string | undefined, fallback: string) => value
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short', timeZone: 'America/New_York' }).format(new Date(value))
+    : fallback;
+  const formatBytes = (value: number) => value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GB` : `${Math.max(1, Math.round(value / 1024 ** 2))} MB`;
+  const lastSuccess = formatTime(backup?.lastSuccess, 'No successful backup yet');
+  const lastAttempt = formatTime(backup?.lastAttempt, 'Not attempted');
+  return (
+    <div className="backup-page">
+      <div className="metrics compact-metrics backup-metrics">
+        <Metric icon={ShieldCheck} value={label} label="Backup status" tone={backup?.state === 'failed' ? 'amber' : 'green'} />
+        <Metric icon={Clock3} value="10:00 AM" label="Daily · Eastern time" tone="indigo" />
+        <Metric icon={Database} value={safeSnapshots.length} label={safeSnapshots.length === 1 ? 'Recovery point' : 'Recovery points'} tone="slate" />
+      </div>
+      <div className="backup-content-grid">
+        <section className="subpage-card backup-overview">
+          <div className="backup-overview-head">
+            <div className="backup-title"><div className="metric-icon green"><HardDrive size={19} /></div><div><b>Assistant Fleet backups</b><span>Incremental, encrypted snapshots of Fleet state and every tenant data volume</span></div></div>
+            <span className={`status-pill ${tone}`}><i />{label}</span>
+          </div>
+          <div className={`backup-message ${backup?.state === 'failed' || backup?.state === 'unavailable' ? 'warning' : ''}`}>
+            {backup?.state === 'running' || backup?.state === 'verifying' || backup?.state === 'restoring' ? <RefreshCw className="spin" size={17} /> : backup?.state === 'failed' || backup?.state === 'unavailable' ? <CircleAlert size={17} /> : <ShieldCheck size={17} />}
+            <span>{backup?.message ?? 'Loading backup status…'}</span>
+          </div>
+          <dl className="backup-facts">
+            <div><dt>Last successful backup</dt><dd>{lastSuccess}</dd></div>
+            <div><dt>Last attempt</dt><dd>{lastAttempt}</dd></div>
+            <div><dt>Duration</dt><dd>{backup?.durationSeconds != null ? `${backup.durationSeconds} seconds` : '—'}</dd></div>
+            <div><dt>Schedule</dt><dd>{backup?.schedule ?? 'Daily at 10:00 AM ET'}</dd></div>
+            <div><dt>Destination</dt><dd><code title={backup?.destination}>{backup?.destination ?? './fleet-backups'}</code></dd></div>
+            <div><dt>Retention</dt><dd>7 daily · 5 weekly · 6 monthly</dd></div>
+          </dl>
+          <div className="backup-page-actions">
+            <button className="secondary-button" disabled={!available || busy || !backup?.lastSuccess} onClick={onVerify}><ShieldCheck size={15} />{pending === 'verify' || backup?.state === 'verifying' ? 'Verifying…' : 'Verify backup'}</button>
+            <button className="primary-button" disabled={!available || busy} onClick={onRun}><RefreshCw className={backup?.state === 'running' ? 'spin' : ''} size={15} />{pending === 'run' || backup?.state === 'running' ? 'Backing up…' : 'Back up now'}</button>
+          </div>
+        </section>
+
+        <section className="subpage-card backup-recovery">
+          <div className="backup-recovery-head"><div className="metric-icon indigo"><ArchiveRestore size={19} /></div><div><b>Restore a recovery point</b><span>Files are restored to a new staging folder. Live tenants are never overwritten.</span></div></div>
+          <div className="snapshot-list">
+            {safeSnapshots.map((snapshot, index) => <button className={`snapshot-option ${selected?.id === snapshot.id ? 'selected' : ''}`} key={snapshot.id} onClick={() => setSelectedId(snapshot.id)}>
+              <span className="snapshot-radio"><i /></span>
+              <span className="snapshot-copy"><b>{formatTime(snapshot.time, 'Unknown time')}{index === 0 && <em>Latest</em>}</b><small><code>{snapshot.shortId}</code> · {snapshot.fileCount.toLocaleString()} files · {formatBytes(snapshot.totalBytes)}</small></span>
+            </button>)}
+            {!safeSnapshots.length && <div className="snapshot-empty"><ArchiveRestore size={24} /><b>No safe recovery points</b><span>Complete a backup before restoring.</span></div>}
+          </div>
+          {backup?.restoreTarget && <div className="restore-result"><Check size={15} /><span><b>Last restored files</b><code title={backup.restoreTarget}>{backup.restoreTarget}</code></span></div>}
+          <div className="restore-actions">
+            <span>Restore creates a copy for inspection.</span>
+            <button className="primary-button" disabled={!available || busy || !selected} onClick={() => selected && onRestore(selected.id)}><ArchiveRestore className={backup?.state === 'restoring' ? 'spin' : ''} size={15} />{pending === 'restore' || backup?.state === 'restoring' ? 'Restoring…' : 'Restore selected'}</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
 function TenantAvatar({ tenant, small = false }: { tenant: Deployment; small?: boolean }) {
   return <div className={`tenant-avatar ${tenant.color} ${small ? 'small' : ''}`}>{tenant.monogram}</div>;
 }
 
 interface DetailPanelProps {
   tenant?: Deployment;
+  contributionRepositories: ContributionRepository[];
   onClose: () => void;
   onAction: (id: string, action: 'deploy' | 'suspend' | 'resume' | 'verify' | 'rollback') => Promise<void>;
   onEdit: (configuration: TenantConfiguration) => void;
   onNavigate: (page: PageName) => void;
 }
 
-function DetailPanel({ tenant, onClose, onAction, onEdit, onNavigate }: DetailPanelProps) {
+function DetailPanel({ tenant, contributionRepositories, onClose, onAction, onEdit, onNavigate }: DetailPanelProps) {
   const [pending, setPending] = useState<string | null>(null);
   const [logs, setLogs] = useState<string | null>(null);
   if (!tenant) return null;
@@ -179,6 +245,14 @@ function DetailPanel({ tenant, onClose, onAction, onEdit, onNavigate }: DetailPa
         <div className="section-title"><div className="section-label">Knowledge snapshots</div><button className="text-button" onClick={() => onNavigate('repositories')}>Manage</button></div>
         <div className="repo-list">
           {tenant.repositoryList.map(repo => <div className="repo" key={repo.name}><FolderGit2 size={16} /><span>{repo.name}</span><code>{repo.revision}</code></div>)}
+        </div>
+      </section>
+
+      <section className="detail-section">
+        <div className="section-title"><div className="section-label">Contribution repositories</div><button className="text-button" onClick={() => onNavigate('repositories')}>Manage</button></div>
+        <div className="repo-list">
+          {contributionRepositories.filter(repository => repository.assignedTenants.includes(tenant.id)).map(repository => <div className="repo contribution-repo" key={repository.id}><GitBranch size={16} /><span>{repository.alias}<small>{repository.remote}</small></span><code>{repository.branchPrefix}*</code></div>)}
+          {!contributionRepositories.some(repository => repository.assignedTenants.includes(tenant.id)) && <span className="detail-empty">No writable repositories assigned.</span>}
         </div>
       </section>
 
@@ -382,39 +456,139 @@ function ActivityPage({ activity, deployments }: { activity: UIActivity[]; deplo
   );
 }
 
-function RepositoriesPage({ deployments, onSelectTenant, onAddRepository }: { deployments: Deployment[]; onSelectTenant: (id: string) => void; onAddRepository: (tenantId: string, repository: RepositorySnapshot) => void }) {
+const newContributionRepository = (deployments: Deployment[]): ContributionRepositoryInput => ({
+  alias: '', provider: 'bitbucket-cloud', remote: '', defaultBranch: 'main',
+  credentialRef: 'secret://bitbucket/repository-token', authorName: 'Assistant Fleet',
+  authorEmail: 'assistant-fleet@localhost', branchPrefix: 'assistant/',
+  assignedTenants: deployments[0] ? [deployments[0].id] : [],
+  protectedPaths: ['.github/**', '.bitbucket/**'], maxChangedFiles: 30,
+  maxChangedBytes: 1_000_000, enabled: true,
+});
+
+interface RepositoriesPageProps {
+  deployments: Deployment[];
+  contributionRepositories: ContributionRepository[];
+  onSelectTenant: (id: string) => void;
+  onAddRepository: (tenantId: string, repository: RepositorySnapshot) => void;
+  onSaveContributionRepository: (repository: ContributionRepositoryInput, id?: string) => Promise<void>;
+  onDeleteContributionRepository: (repository: ContributionRepository) => Promise<void>;
+  backup: BackupStatus | null;
+  backupSnapshots: BackupSnapshot[];
+  backupPending: 'run' | 'verify' | 'restore' | null;
+  onRunBackup: () => void;
+  onVerifyBackup: () => void;
+  onRestoreBackup: (snapshotId: string) => void;
+}
+
+function RepositoriesPage({ deployments, contributionRepositories, onSelectTenant, onAddRepository, onSaveContributionRepository, onDeleteContributionRepository, backup, backupSnapshots, backupPending, onRunBackup, onVerifyBackup, onRestoreBackup }: RepositoriesPageProps) {
   const repos = deployments.flatMap(tenant => tenant.repositoryList.map(repo => ({ ...repo, tenant })));
+  const [tab, setTab] = useState<'knowledge' | 'contributions' | 'backups'>('knowledge');
   const [copiedRepo, setCopiedRepo] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
-  const [form, setForm] = useState({ tenantId: deployments[0]?.id || '', name: '', revision: '' });
+  const [snapshotForm, setSnapshotForm] = useState({ tenantId: deployments[0]?.id || '', name: '', revision: '' });
+  const [contributionForm, setContributionForm] = useState<ContributionRepositoryInput>(() => newContributionRepository(deployments));
+  const [editingId, setEditingId] = useState<string | undefined>();
+  const [submitting, setSubmitting] = useState(false);
   const copyPath = (repo: RepositorySnapshot) => {
     navigator.clipboard?.writeText(`/data/workspaces/knowledge/${repo.name}`);
     setCopiedRepo(repo.name); setTimeout(() => setCopiedRepo(null), 1500);
   };
+  const openAdd = () => {
+    setEditingId(undefined);
+    setContributionForm(newContributionRepository(deployments));
+    setAdding(true);
+  };
+  const openEdit = (repository: ContributionRepository) => {
+    const { id: _id, createdAt: _createdAt, updatedAt: _updatedAt, ...input } = repository;
+    setEditingId(repository.id);
+    setContributionForm(input);
+    setAdding(true);
+  };
+  const saveContribution = async () => {
+    setSubmitting(true);
+    try {
+      await onSaveContributionRepository(contributionForm, editingId);
+      setAdding(false);
+      setEditingId(undefined);
+    } catch { /* Parent displays the API error. */ } finally { setSubmitting(false); }
+  };
+  const assigned = (repository: ContributionRepository) => deployments.filter(tenant => repository.assignedTenants.includes(tenant.id));
   return (
     <div className="page subpage">
-      <PageHeading eyebrow="KNOWLEDGE DELIVERY" title="Repositories" description="Track immutable, tenant-scoped repository snapshots mounted read-only." action={<button className="primary-button" onClick={() => setAdding(v => !v)}>{adding ? <X size={16} /> : <Plus size={16} />}{adding ? 'Cancel' : 'Add snapshot'}</button>} />
-      {adding && <div className="snapshot-form">
-        <label><span>Tenant</span><select value={form.tenantId} onChange={e => setForm(v => ({ ...v, tenantId: e.target.value }))}>{deployments.map(d => <option value={d.id} key={d.id}>{d.name}</option>)}</select></label>
-        <label><span>Repository name</span><input value={form.name} onChange={e => setForm(v => ({ ...v, name: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') }))} placeholder="product-docs" /></label>
-        <label><span>Exact revision</span><input value={form.revision} onChange={e => setForm(v => ({ ...v, revision: e.target.value }))} placeholder="c52f941" /></label>
-        <button className="primary-button" disabled={!form.tenantId || !form.name || !form.revision} onClick={() => { onAddRepository(form.tenantId, { name: form.name, revision: form.revision }); setAdding(false); setForm(v => ({ ...v, name: '', revision: '' })); }}><Check size={16} />Mount snapshot</button>
-      </div>}
-      <div className="metrics compact-metrics">
-        <Metric icon={FolderGit2} value={repos.length} label="Mounted snapshots" tone="slate" />
-        <Metric icon={Layers3} value={new Set(repos.map(r => r.tenant.id)).size} label="Tenants with knowledge" tone="indigo" />
-        <Metric icon={ShieldCheck} value="100%" label="Read-only mounts" tone="green" />
+      <PageHeading eyebrow={tab === 'backups' ? 'RECOVERY' : 'CODE & KNOWLEDGE'} title={tab === 'backups' ? 'Backups' : 'Repositories'} description={tab === 'knowledge' ? 'Track immutable, tenant-scoped snapshots mounted read-only.' : tab === 'contributions' ? 'Assign multiple writable contribution repositories to each assistant.' : 'Monitor and manage encrypted recovery points for the entire local fleet.'} action={tab !== 'backups' ?
+        <button className="primary-button" onClick={() => adding ? setAdding(false) : tab === 'knowledge' ? setAdding(true) : openAdd()}>{adding ? <X size={16} /> : <Plus size={16} />}{adding ? 'Cancel' : tab === 'knowledge' ? 'Add snapshot' : 'Add contribution repository'}</button> : undefined
+      } />
+      <div className="repository-tabs" role="tablist" aria-label="Repository type">
+        <button role="tab" aria-selected={tab === 'knowledge'} className={tab === 'knowledge' ? 'active' : ''} onClick={() => { setTab('knowledge'); setAdding(false); }}><Database size={16} />Knowledge snapshots <span>{repos.length}</span></button>
+        <button role="tab" aria-selected={tab === 'contributions'} className={tab === 'contributions' ? 'active' : ''} onClick={() => { setTab('contributions'); setAdding(false); }}><GitBranch size={16} />Contribution repositories <span>{contributionRepositories.length}</span></button>
+        <button role="tab" aria-selected={tab === 'backups'} className={tab === 'backups' ? 'active' : ''} onClick={() => { setTab('backups'); setAdding(false); }}><HardDrive size={16} />Backups <span className={`backup-tab-dot ${backup?.state === 'success' ? 'healthy' : backup?.state === 'failed' ? 'failed' : ''}`} /></button>
       </div>
-      <div className="subpage-card repo-table">
-        <div className="repo-table-head"><span>Repository</span><span>Tenant</span><span>Revision</span><span>Mount path</span><span /></div>
-        {repos.map(repo => <div className="repo-table-row" key={`${repo.tenant.id}-${repo.name}`}>
-          <div className="repo-name"><div className="metric-icon slate"><FolderGit2 size={17} /></div><span><b>{repo.name}</b><small>Immutable snapshot</small></span></div>
-          <button className="tenant-link" onClick={() => onSelectTenant(repo.tenant.id)}><TenantAvatar tenant={repo.tenant} small />{repo.tenant.name}</button>
-          <code>{repo.revision}</code>
-          <button className="path-copy" onClick={() => copyPath(repo)}><code>/knowledge/{repo.name}</code>{copiedRepo === repo.name ? <Check size={14} /> : <Copy size={14} />}</button>
-          <button className="icon-button" onClick={() => copyPath(repo)} title="Copy mount path">{copiedRepo === repo.name ? <Check size={16} /> : <Copy size={16} />}</button>
-        </div>)}
-      </div>
+
+      {tab === 'backups' && <BackupPanel backup={backup} snapshots={backupSnapshots} pending={backupPending} onRun={onRunBackup} onVerify={onVerifyBackup} onRestore={onRestoreBackup} />}
+
+      {tab === 'knowledge' && <>
+        {adding && <div className="snapshot-form">
+          <label><span>Tenant</span><select value={snapshotForm.tenantId} onChange={e => setSnapshotForm(v => ({ ...v, tenantId: e.target.value }))}>{deployments.map(d => <option value={d.id} key={d.id}>{d.name}</option>)}</select></label>
+          <label><span>Repository name</span><input value={snapshotForm.name} onChange={e => setSnapshotForm(v => ({ ...v, name: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') }))} placeholder="product-docs" /></label>
+          <label><span>Exact revision</span><input value={snapshotForm.revision} onChange={e => setSnapshotForm(v => ({ ...v, revision: e.target.value }))} placeholder="c52f941" /></label>
+          <button className="primary-button" disabled={!snapshotForm.tenantId || !snapshotForm.name || !snapshotForm.revision} onClick={() => { onAddRepository(snapshotForm.tenantId, { name: snapshotForm.name, revision: snapshotForm.revision }); setAdding(false); setSnapshotForm(v => ({ ...v, name: '', revision: '' })); }}><Check size={16} />Mount snapshot</button>
+        </div>}
+        <div className="metrics compact-metrics">
+          <Metric icon={FolderGit2} value={repos.length} label="Mounted snapshots" tone="slate" />
+          <Metric icon={Layers3} value={new Set(repos.map(r => r.tenant.id)).size} label="Tenants with knowledge" tone="indigo" />
+          <Metric icon={ShieldCheck} value="100%" label="Read-only mounts" tone="green" />
+        </div>
+        <div className="subpage-card repo-table">
+          <div className="repo-table-head"><span>Repository</span><span>Tenant</span><span>Revision</span><span>Mount path</span><span /></div>
+          {repos.map(repo => <div className="repo-table-row" key={`${repo.tenant.id}-${repo.name}`}>
+            <div className="repo-name"><div className="metric-icon slate"><FolderGit2 size={17} /></div><span><b>{repo.name}</b><small>Immutable snapshot</small></span></div>
+            <button className="tenant-link" onClick={() => onSelectTenant(repo.tenant.id)}><TenantAvatar tenant={repo.tenant} small />{repo.tenant.name}</button>
+            <code>{repo.revision}</code>
+            <button className="path-copy" onClick={() => copyPath(repo)}><code>/knowledge/{repo.name}</code>{copiedRepo === repo.name ? <Check size={14} /> : <Copy size={14} />}</button>
+            <button className="icon-button" onClick={() => copyPath(repo)} title="Copy mount path">{copiedRepo === repo.name ? <Check size={16} /> : <Copy size={16} />}</button>
+          </div>)}
+        </div>
+      </>}
+
+      {tab === 'contributions' && <>
+        {adding && <div className="contribution-form subpage-card">
+          <div className="contribution-form-head"><div><b>{editingId ? 'Edit contribution repository' : 'New contribution repository'}</b><span>Credentials stay external; store only a secret reference.</span></div></div>
+          <div className="form-grid contribution-form-grid">
+            <label><span>Provider</span><select aria-label="Provider" value={contributionForm.provider} onChange={e => setContributionForm(v => ({ ...v, provider: e.target.value as ContributionRepositoryInput['provider'], credentialRef: e.target.value === 'github' ? 'secret://github/repository-token' : 'secret://bitbucket/repository-token' }))}><option value="bitbucket-cloud">Bitbucket Cloud</option><option value="github">GitHub</option></select></label>
+            <label><span>Repository</span><input aria-label="Repository" value={contributionForm.remote} onChange={e => setContributionForm(v => ({ ...v, remote: e.target.value }))} placeholder="workspace/repository" /></label>
+            <label><span>Alias</span><input aria-label="Alias" value={contributionForm.alias} onChange={e => setContributionForm(v => ({ ...v, alias: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') }))} placeholder="payments-api" /></label>
+            <label><span>Default branch</span><input aria-label="Default branch" value={contributionForm.defaultBranch} onChange={e => setContributionForm(v => ({ ...v, defaultBranch: e.target.value }))} placeholder="main" /></label>
+            <label><span>Credential reference</span><input aria-label="Credential reference" value={contributionForm.credentialRef} onChange={e => setContributionForm(v => ({ ...v, credentialRef: e.target.value }))} placeholder="secret://bitbucket/payments-api" /></label>
+            <label><span>Branch prefix</span><input aria-label="Branch prefix" value={contributionForm.branchPrefix} onChange={e => setContributionForm(v => ({ ...v, branchPrefix: e.target.value }))} placeholder="assistant/" /></label>
+            <label><span>Commit author</span><input value={contributionForm.authorName} onChange={e => setContributionForm(v => ({ ...v, authorName: e.target.value }))} /></label>
+            <label><span>Commit author email</span><input value={contributionForm.authorEmail} onChange={e => setContributionForm(v => ({ ...v, authorEmail: e.target.value }))} /></label>
+            <label className="full"><span>Assigned tenants</span><select aria-label="Assigned tenants" multiple value={contributionForm.assignedTenants} onChange={e => setContributionForm(v => ({ ...v, assignedTenants: [...e.target.selectedOptions].map(option => option.value) }))}>{deployments.map(tenant => <option key={tenant.id} value={tenant.id}>{tenant.name}</option>)}</select><small>Select every assistant that may contribute to this repository.</small></label>
+            <label><span>Maximum changed files</span><input type="number" min="1" max="500" value={contributionForm.maxChangedFiles} onChange={e => setContributionForm(v => ({ ...v, maxChangedFiles: Number(e.target.value) }))} /></label>
+            <label><span>Maximum changed bytes</span><input type="number" min="1" max="50000000" value={contributionForm.maxChangedBytes} onChange={e => setContributionForm(v => ({ ...v, maxChangedBytes: Number(e.target.value) }))} /></label>
+            <label className="full"><span>Protected paths</span><input value={contributionForm.protectedPaths.join(', ')} onChange={e => setContributionForm(v => ({ ...v, protectedPaths: e.target.value.split(',').map(item => item.trim()).filter(Boolean) }))} placeholder=".github/**, .bitbucket/**" /></label>
+          </div>
+          <div className="contribution-form-actions"><button className="secondary-button" onClick={() => setAdding(false)}>Cancel</button><button className="primary-button" disabled={submitting || !contributionForm.alias || !contributionForm.remote || !contributionForm.assignedTenants.length} onClick={() => void saveContribution()}><Check size={16} />{submitting ? 'Saving…' : 'Save repository'}</button></div>
+        </div>}
+        <div className="metrics compact-metrics">
+          <Metric icon={GitBranch} value={contributionRepositories.length} label="Contribution repositories" tone="slate" />
+          <Metric icon={Layers3} value={new Set(contributionRepositories.flatMap(repository => repository.assignedTenants)).size} label="Agents with code access" tone="indigo" />
+          <Metric icon={ShieldCheck} value={contributionRepositories.filter(repository => repository.enabled).length} label="Enabled repositories" tone="green" />
+        </div>
+        <div className="contribution-repo-grid">
+          {contributionRepositories.map(repository => <article className={`contribution-repo-card ${repository.enabled ? '' : 'disabled'}`} key={repository.id}>
+            <div className="contribution-repo-head"><div className="metric-icon slate"><GitBranch size={17} /></div><div><b>{repository.alias}</b><span>{repository.remote}</span></div><span className={`status-pill ${repository.enabled ? 'healthy' : 'suspended'}`}><i />{repository.enabled ? 'Enabled' : 'Disabled'}</span></div>
+            <dl className="facts">
+              <div><dt>Provider</dt><dd>{repository.provider === 'bitbucket-cloud' ? 'Bitbucket Cloud' : 'GitHub'}</dd></div>
+              <div><dt>Default branch</dt><dd><code>{repository.defaultBranch}</code></dd></div>
+              <div><dt>Contribution branches</dt><dd><code>{repository.branchPrefix}*</code></dd></div>
+              <div><dt>Credential</dt><dd><code>{repository.credentialRef}</code></dd></div>
+            </dl>
+            <div className="assigned-tenants"><span>Assigned agents</span><div>{assigned(repository).map(tenant => <button key={tenant.id} onClick={() => onSelectTenant(tenant.id)}><TenantAvatar tenant={tenant} small />{tenant.name}</button>)}</div></div>
+            <div className="contribution-repo-actions"><button className="secondary-button" onClick={() => void onSaveContributionRepository({ ...repository, enabled: !repository.enabled }, repository.id).catch(() => undefined)}>{repository.enabled ? 'Disable' : 'Enable'}</button><button className="icon-button" title="Edit repository" onClick={() => openEdit(repository)}><Pencil size={15} /></button><button className="icon-button danger" title="Delete repository" onClick={() => { if (window.confirm(`Remove ${repository.alias} from every assigned agent?`)) void onDeleteContributionRepository(repository).catch(() => undefined); }}><Trash2 size={15} /></button></div>
+          </article>)}
+          {!contributionRepositories.length && <div className="empty-state contribution-empty"><GitBranch size={26} /><b>No contribution repositories</b><span>Add a repository and assign it to one or more assistants.</span><button className="primary-button" onClick={openAdd}><Plus size={16} />Add contribution repository</button></div>}
+        </div>
+      </>}
     </div>
   );
 }
@@ -442,11 +616,11 @@ function AccessPage({ deployments, onSelectTenant }: { deployments: Deployment[]
   );
 }
 
-function SettingsPage({ deployments, onOpenContract }: { deployments: Deployment[]; onOpenContract: () => void }) {
+function SettingsPage({ deployments, contributionRepositories, onOpenContract }: { deployments: Deployment[]; contributionRepositories: ContributionRepository[]; onOpenContract: () => void }) {
   const [settings, setSettings] = useState({ health: true, isolation: true, confirm: true, refresh: '30 seconds' });
   const toggle = (key: 'health' | 'isolation' | 'confirm') => setSettings(v => ({ ...v, [key]: !v[key] }));
   const exportConfig = () => {
-    const blob = new Blob([JSON.stringify({ version: 1, deployments }, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify({ version: 1, deployments, contributionRepositories }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob); const link = document.createElement('a');
     link.href = url; link.download = 'assistant-fleet-local.json'; link.click(); URL.revokeObjectURL(url);
   };
@@ -478,13 +652,76 @@ function ContractPage() {
     ['Explicit Slack access', 'Team identity, installation namespace, and channels must be configured. User restrictions are optional.'],
     ['Pinned reviewed artifacts', 'Application images, skill bundles, and repository snapshots use exact revisions.'],
     ['Read-only knowledge', 'Approved repository snapshots mount below the tenant knowledge workspace.'],
+    ['Explicit code assignments', 'Writable contribution repositories are assigned per tenant and publish only through the planned credential-isolated broker.'],
     ['Secrets outside the workspace', 'Slack tokens, provider credentials, and Git keys are not persisted here.'],
   ];
   return <div className="page subpage"><PageHeading eyebrow="ARCHITECTURE" title="Deployment contract" description="The operational boundaries every local tenant stack must preserve." /><div className="contract-grid">{rules.map(([title, text], index) => <div className="contract-rule" key={title}><span>{String(index + 1).padStart(2, '0')}</span><div><b>{title}</b><p>{text}</p></div><Check size={17} /></div>)}</div></div>;
 }
 
-export default function App() {
+function ApprovalPage({ token }: { token: string }) {
+  const [approval, setApproval] = useState<ContributionApproval | null>(null);
+  const [error, setError] = useState('');
+  const [pending, setPending] = useState<'publish' | 'abort' | null>(null);
+  useEffect(() => {
+    void fleetApi.contributionApproval(token)
+      .then(result => setApproval(result.approval))
+      .catch(reason => setError(reason instanceof Error ? reason.message : String(reason)));
+  }, [token]);
+  const act = async (action: 'publish' | 'abort') => {
+    if (action === 'publish' && !window.confirm('Publish this exact validated commit to the generated contribution branch?')) return;
+    if (action === 'abort' && !window.confirm('Abort this contribution and remove its isolated checkout?')) return;
+    setPending(action); setError('');
+    try {
+      const result = action === 'publish'
+        ? await fleetApi.publishContributionApproval(token)
+        : await fleetApi.abortContributionApproval(token);
+      setApproval(result.approval);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally { setPending(null); }
+  };
+  const bytes = approval ? new Intl.NumberFormat().format(approval.changedBytes) : '0';
+  return (
+    <main className="approval-shell">
+      <section className="approval-card">
+        <div className="approval-brand"><BrandMark /><div><span>ASSISTANT FLEET</span><b>Contribution approval</b></div></div>
+        {error && !approval && <div className="approval-state error"><CircleAlert size={24} /><h1>Approval unavailable</h1><p>{error}</p></div>}
+        {!error && !approval && <div className="approval-state"><RefreshCw className="spin" size={24} /><h1>Loading contribution</h1></div>}
+        {approval && <>
+          <div className="approval-heading">
+            <span className={`approval-status ${approval.status}`}>{approval.status === 'ready' ? 'Ready for review' : approval.status}</span>
+            <h1>{approval.repositoryAlias}</h1>
+            <p>{approval.repositoryRemote} · {approval.tenantName}</p>
+          </div>
+          <dl className="approval-facts">
+            <div><dt>Target branch</dt><dd><code>{approval.defaultBranch}</code></dd></div>
+            <div><dt>Contribution branch</dt><dd><code>{approval.branch}</code></dd></div>
+            <div><dt>Commit</dt><dd><code>{approval.preparedCommitSha?.slice(0, 12) ?? 'Pending'}</code></dd></div>
+            <div><dt>Commit message</dt><dd>{approval.commitMessage ?? '—'}</dd></div>
+            <div><dt>Validated change</dt><dd>{approval.changedFiles.length} file(s) · {bytes} bytes</dd></div>
+            <div><dt>Approval expires</dt><dd>{new Date(approval.approvalExpiresAt).toLocaleString()}</dd></div>
+          </dl>
+          <div className="approval-files">
+            <span>Changed files</span>
+            {approval.changedFiles.map(file => <code key={file}>{file}</code>)}
+          </div>
+          {approval.validationSummary && <div className="approval-validation"><ShieldCheck size={17} /><span>{approval.validationSummary}</span></div>}
+          {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
+          {approval.status === 'ready' && <div className="approval-actions">
+            <button className="secondary-button" disabled={pending !== null} onClick={() => void act('abort')}>{pending === 'abort' ? 'Aborting…' : 'Abort'}</button>
+            <button className="primary-button" disabled={pending !== null} onClick={() => void act('publish')}><GitBranch size={16} />{pending === 'publish' ? 'Publishing…' : 'Publish branch'}</button>
+          </div>}
+          {approval.status === 'published' && <div className="approval-result"><Check size={22} /><div><b>Branch published</b><span>The reviewed commit was pushed successfully.</span></div>{approval.pullRequestUrl && <a href={approval.pullRequestUrl} target="_blank" rel="noreferrer">Open pull request <ExternalLink size={15} /></a>}</div>}
+          {approval.status === 'aborted' && <div className="approval-result aborted"><X size={22} /><div><b>Contribution aborted</b><span>No remote branch was created.</span></div></div>}
+        </>}
+      </section>
+    </main>
+  );
+}
+
+function FleetConsole() {
   const [deployments, setDeployments] = useState<Deployment[]>(readStored);
+  const [contributionRepositories, setContributionRepositories] = useState<ContributionRepository[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>('acme');
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('All');
@@ -495,6 +732,9 @@ export default function App() {
   const [pageName, setPageName] = useState<PageName>('deployments');
   const [apiConnected, setApiConnected] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<{ tone: 'error' | 'success'; message: string } | null>(null);
+  const [backup, setBackup] = useState<BackupStatus | null>(null);
+  const [backupSnapshots, setBackupSnapshots] = useState<BackupSnapshot[]>([]);
+  const [backupPending, setBackupPending] = useState<'run' | 'verify' | 'restore' | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -503,6 +743,7 @@ export default function App() {
         const state = await fleetApi.state();
         if (!active) return;
         setDeployments(state.deployments);
+        setContributionRepositories(state.contributionRepositories ?? []);
         setActivity(state.activities.map(toUIActivity));
         setSelectedId(current => state.deployments.some(item => item.id === current) ? current : state.deployments[0]?.id ?? null);
         setApiConnected(true);
@@ -517,9 +758,44 @@ export default function App() {
     return () => { active = false; window.clearInterval(interval); };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const result = await fleetApi.backupStatus();
+        if (active) setBackup(result.backup);
+      } catch (error) {
+        if (active) setBackup({
+          state: 'unavailable', operation: 'none', containerState: 'not-created',
+          message: error instanceof Error ? error.message : String(error), updatedAt: '', lastAttempt: '', lastSuccess: '', lastRestore: '', restoreTarget: '', durationSeconds: null,
+          schedule: 'Daily at 10:00 AM ET', destination: './fleet-backups',
+        });
+      }
+      try {
+        const result = await fleetApi.backupSnapshots();
+        if (active) setBackupSnapshots(result.snapshots);
+      } catch { if (active) setBackupSnapshots([]); }
+    };
+    void load();
+    const interval = window.setInterval(load, 5_000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, []);
+
+  const runBackupAction = async (action: 'run' | 'verify' | 'restore', snapshotId?: string) => {
+    setBackupPending(action);
+    try {
+      const result = action === 'run' ? await fleetApi.runBackup() : action === 'verify' ? await fleetApi.verifyBackup() : await fleetApi.restoreBackup(snapshotId || '');
+      setBackup(result.backup);
+      setNotice({ tone: 'success', message: action === 'run' ? 'Backup started.' : action === 'verify' ? 'Backup verification started.' : 'Restore started in a safe staging folder.' });
+    } catch (error) {
+      setNotice({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
+    } finally { setBackupPending(null); }
+  };
+
   const refreshState = async () => {
     const state = await fleetApi.state();
     setDeployments(state.deployments);
+    setContributionRepositories(state.contributionRepositories ?? []);
     setActivity(state.activities.map(toUIActivity));
     setApiConnected(true);
   };
@@ -548,6 +824,27 @@ export default function App() {
       setNotice({ tone: 'success', message: `${repository.name}@${repository.revision} was mounted read-only.` });
     } catch (error) {
       setNotice({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
+    }
+  };
+  const saveContributionRepository = async (repository: ContributionRepositoryInput, id?: string) => {
+    try {
+      if (id) await fleetApi.updateContributionRepository(id, repository);
+      else await fleetApi.createContributionRepository(repository);
+      await refreshState();
+      setNotice({ tone: 'success', message: `${repository.alias} was ${id ? 'updated' : 'registered'} for ${repository.assignedTenants.length} ${repository.assignedTenants.length === 1 ? 'agent' : 'agents'}.` });
+    } catch (error) {
+      setNotice({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  };
+  const deleteContributionRepository = async (repository: ContributionRepository) => {
+    try {
+      await fleetApi.deleteContributionRepository(repository.id);
+      await refreshState();
+      setNotice({ tone: 'success', message: `${repository.alias} was removed from all assigned agents.` });
+    } catch (error) {
+      setNotice({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
+      throw error;
     }
   };
   const runAction = async (id: string, action: 'deploy' | 'suspend' | 'resume' | 'verify' | 'rollback') => {
@@ -605,7 +902,7 @@ export default function App() {
           <div className="metrics">
             <Metric icon={Layers3} value={deployments.length} label="Tenant stacks" tone="indigo" />
             <Metric icon={Activity} value={`${healthy}/${deployments.length}`} label="Healthy" tone="green" />
-            <Metric icon={FolderGit2} value={repositories} label="Repo snapshots" tone="slate" />
+            <Metric icon={FolderGit2} value={repositories + contributionRepositories.length} label="Repository sources" tone="slate" />
             <Metric icon={CircleAlert} value={attention} label="Needs attention" tone="amber" />
           </div>
 
@@ -645,14 +942,19 @@ export default function App() {
         </div>
         }
         {pageName === 'activity' && <ActivityPage activity={activity} deployments={deployments} />}
-        {pageName === 'repositories' && <RepositoriesPage deployments={deployments} onSelectTenant={openTenant} onAddRepository={addRepository} />}
+        {pageName === 'repositories' && <RepositoriesPage deployments={deployments} contributionRepositories={contributionRepositories} onSelectTenant={openTenant} onAddRepository={addRepository} onSaveContributionRepository={saveContributionRepository} onDeleteContributionRepository={deleteContributionRepository} backup={backup} backupSnapshots={backupSnapshots} backupPending={backupPending} onRunBackup={() => void runBackupAction('run')} onVerifyBackup={() => void runBackupAction('verify')} onRestoreBackup={snapshotId => void runBackupAction('restore', snapshotId)} />}
         {pageName === 'access' && <AccessPage deployments={deployments} onSelectTenant={openTenant} />}
-        {pageName === 'settings' && <SettingsPage deployments={deployments} onOpenContract={() => navigate('contract')} />}
+        {pageName === 'settings' && <SettingsPage deployments={deployments} contributionRepositories={contributionRepositories} onOpenContract={() => navigate('contract')} />}
         {pageName === 'contract' && <ContractPage />}
       </main>
 
-      {pageName === 'deployments' && <DetailPanel tenant={selected} onClose={() => setSelectedId(null)} onAction={runAction} onEdit={configuration => { setEditingConfiguration(configuration); setShowNew(true); }} onNavigate={navigate} />}
+      {pageName === 'deployments' && <DetailPanel tenant={selected} contributionRepositories={contributionRepositories} onClose={() => setSelectedId(null)} onAction={runAction} onEdit={configuration => { setEditingConfiguration(configuration); setShowNew(true); }} onNavigate={navigate} />}
       {showNew && <NewDeployment initial={editingConfiguration ?? undefined} onClose={() => { setShowNew(false); setEditingConfiguration(null); }} onCreate={createDeployment} />}
     </div>
   );
+}
+
+export default function App() {
+  const match = window.location.pathname.match(/^\/contributions\/approve\/([A-Za-z0-9_-]{43})$/);
+  return match ? <ApprovalPage token={match[1]} /> : <FleetConsole />;
 }

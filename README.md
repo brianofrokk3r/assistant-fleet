@@ -57,6 +57,13 @@ npm run build
 docker compose config --quiet
 ```
 
+The planned writable-repository contribution workflow and its API, frontend,
+broker, and E2E task breakdown are documented in
+[Contribution repositories delivery plan](docs/contribution-repositories-plan.md).
+The contract tests can be listed with `npx playwright test --list`; they become
+green as the planned endpoints and UI are delivered. The live remote branch-push
+test is separately gated and never runs as part of the default suite.
+
 ## What is operational
 
 - Typed Slack and Discord creation flows with adapter-specific requirements
@@ -69,6 +76,8 @@ docker compose config --quiet
 - In-place migration support for existing data volumes, managed workspaces, auxiliary secret references, and tenant-local n8n intake relays
 - Deploy, suspend, resume, verify, rollback, and container-log operations
 - Immutable read-only knowledge snapshot mounts
+- Persisted GitHub/Bitbucket contribution-repository registry with many-to-many tenant assignments
+- Tenant-scoped `fleet-contribute` workflow for isolated checkouts, validated local commits, short-lived operator approval links, protected `assistant/*` branch pushes, and pull-request handoff URLs
 - Reviewed skillsets copied into each tenant's writable provider directory by a one-shot initializer
 - Activity history, configuration editing, JSON export, and 15-second refresh
 
@@ -124,14 +133,70 @@ To mount knowledge, publish the exact snapshot directory first, then add the
 repository and revision in the console. The API rejects missing or path-unsafe
 snapshot references.
 
+## Daily backups
+
+The `fleet-backup` service creates an incremental, encrypted Restic snapshot at
+10:00 AM America/New_York every day. By default, its repository is stored in the
+ignored local `fleet-backups/restic` directory. It backs up Fleet state, tenant
+configuration and workspaces, rendered skillsets, knowledge snapshots, local
+secrets, and the Docker `/data` volume used by every Fleet-managed tenant.
+
+The service creates `.assistant-fleet-restic-password` inside the configured
+backup destination on first start. Keep a second secure copy of that file: the
+backups cannot be restored without it. The password next to the repository makes
+unattended local recovery simple, but does not protect the backup if someone
+obtains the entire destination.
+
+Start the console and backup scheduler together:
+
+```bash
+cp .env.example .env
+mkdir -p backup-restore fleet-backups
+docker compose up -d --build
+```
+
+Edit the ignored `.env` file to set `FLEET_PUBLIC_URL` and, if desired,
+`FLEET_BACKUP_DESTINATION` to an absolute host path. Docker Desktop users may
+also need to add that path under **Settings > Resources > File sharing**. Native
+Docker Engine installations do not require this Docker Desktop step.
+
+Run or inspect backups manually:
+
+```bash
+docker compose exec fleet-backup fleet-backup run
+docker compose exec fleet-backup fleet-backup snapshots
+docker compose exec fleet-backup fleet-backup check
+```
+
+Restore a snapshot into the ignored local `backup-restore/` directory for
+inspection. This never overwrites live Fleet data:
+
+```bash
+docker compose run --rm fleet-backup restore latest
+```
+
+The default retention policy keeps 7 daily, 5 weekly, and 6 monthly snapshots.
+During a backup, each running tenant assistant is paused only while its `/data`
+volume is copied, then immediately resumed. Backup progress and failures are
+available through `docker compose logs fleet-backup`. The console's
+**Repositories > Backups** tab shows the same live status and provides manual
+backup and verification controls.
+
 ## API
 
 The same-origin API exposes:
 
 - `GET /api/health`, `GET /api/state`
+- `GET /api/backups/status`
+- `POST /api/backups/{run|verify}`
 - `POST /api/deployments`, `PUT /api/deployments/:id`
 - `GET /api/deployments/:id/compose`, `GET /api/deployments/:id/logs`
 - `POST /api/deployments/:id/repositories`
+- `GET /api/deployments/:id/contributions[/:contributionId]`
+- `POST /api/deployments/:id/contributions/prepare`
+- `POST /api/deployments/:id/contributions/:contributionId/{ready|abort}`
+- `GET /api/contribution-approvals/:token`
+- `POST /api/contribution-approvals/:token/{publish|abort}`
 - `POST /api/deployments/:id/actions/{deploy|suspend|resume|verify|rollback}`
 
 Set `FLEET_DOCKER_ENABLED=false` to exercise configuration and rendering without

@@ -2,16 +2,19 @@ services:
   fleet-console:
     build:
       context: .
+      target: runtime
     image: assistant-fleet-console:local
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${FLEET_PORT:-8080}:8080"
+      - "127.0.0.1:${FLEET_PORT:-8090}:8080"
     environment:
       FLEET_ROOT: ${PWD}
       FLEET_UI_DIR: /app/dist
       FLEET_BIND_HOST: 0.0.0.0
       FLEET_PORT: 8080
       FLEET_DOCKER_ENABLED: "true"
+      FLEET_PUBLIC_URL: ${FLEET_PUBLIC_URL:-http://127.0.0.1:8090}
+      FLEET_BACKUP_DESTINATION: ${FLEET_BACKUP_DESTINATION:-./fleet-backups}
     env_file:
       - path: .env.console
         required: false
@@ -50,3 +53,42 @@ services:
       interval: 15s
       timeout: 3s
       retries: 5
+
+  fleet-backup:
+    build:
+      context: .
+      target: backup
+    image: assistant-fleet-backup:local
+    hostname: fleet-backup
+    restart: unless-stopped
+    environment:
+      TZ: America/New_York
+      RESTIC_REPOSITORY: /backup-root/restic
+      RESTIC_PASSWORD_FILE: /backup-root/.assistant-fleet-restic-password
+      RESTIC_CACHE_DIR: /tmp/restic-cache
+    volumes:
+      - type: bind
+        source: .
+        target: /fleet
+        read_only: true
+      - type: bind
+        source: ${FLEET_BACKUP_DESTINATION:-./fleet-backups}
+        target: /backup-root
+      - type: bind
+        source: ./backup-restore
+        target: /restore
+      - type: volume
+        source: fleet-backup-staging
+        target: /staging
+      - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+      - /run:rw,noexec,nosuid,nodev,size=8m
+    network_mode: none
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  fleet-backup-staging:

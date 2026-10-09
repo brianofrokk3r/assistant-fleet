@@ -18,5 +18,5 @@
     "jsx": "react-jsx",
     "types": ["vite/client", "node"]
   },
-  "include": ["src", "server", "shared", "vite.config.js"]
+  "include": ["src", "server", "shared", "e2e", "playwright.config.ts", "vite.config.js"]
 }

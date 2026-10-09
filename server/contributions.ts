@@ -111,7 +111,7 @@ export class ContributionRuntime {
 
   private async git(cwd: string, args: string[], env: NodeJS.ProcessEnv = gitEnvironment): Promise<GitResult> {
     return await new Promise((resolve, reject) => {
-      const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=', ...args], {
+      const child = spawn('git', ['-c', `safe.directory=${cwd}`, '-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=', ...args], {
         cwd,
         env: { PATH: process.env.PATH, HOME: process.env.HOME, ...env },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -176,10 +176,14 @@ export class ContributionRuntime {
     }
   }
 
-  async publish(contribution: Contribution, repository: ContributionRepository, input: { expectedBaseSha: string; message: string; branch?: string }): Promise<Contribution> {
-    if (contribution.status === 'published') return contribution;
+  async ready(contribution: Contribution, repository: ContributionRepository, input: { expectedBaseSha: string; message: string }): Promise<Contribution> {
+    if (contribution.status === 'ready') {
+      if (input.expectedBaseSha !== contribution.baseSha || input.message?.trim() !== contribution.commitMessage) {
+        throw new ContributionError('Ready contribution approval can only be renewed with its original base SHA and commit message.', 409);
+      }
+      return contribution;
+    }
     if (contribution.status !== 'prepared') throw new ContributionError(`Contribution is ${contribution.status}, not prepared.`, 409);
-    if (input.branch && input.branch !== contribution.branch) throw new ContributionError('The publish branch must match the generated contribution branch.');
     if (input.expectedBaseSha !== contribution.baseSha) throw new ContributionError('The expected base SHA does not match the prepared checkout.', 409);
     if (!input.message?.trim() || input.message.length > 200 || /[\0\r\n]/.test(input.message)) throw new ContributionError('Commit message must be 1-200 characters on one line.');
     if (!contribution.branch.startsWith(repository.branchPrefix) || contribution.branch === repository.defaultBranch) {
@@ -233,15 +237,55 @@ export class ContributionRuntime {
       const remoteBranch = (await this.git(checkout, ['ls-remote', 'origin', `refs/heads/${contribution.branch}`], auth.env)).stdout.trim();
       if (remoteBranch) throw new ContributionError('The generated contribution branch already exists remotely.', 409);
       await this.git(checkout, ['commit', '-m', input.message.trim()]);
-      const publishedSha = (await this.git(checkout, ['rev-parse', 'HEAD'])).stdout.trim();
+      const preparedCommitSha = (await this.git(checkout, ['rev-parse', 'HEAD'])).stdout.trim();
+      return {
+        ...contribution,
+        status: 'ready',
+        commitMessage: input.message.trim(),
+        preparedCommitSha,
+        changedFiles: changed,
+        changedBytes,
+        validationSummary: `${changed.length} file(s), ${changedBytes} byte(s) validated and committed locally for approval.`,
+        updatedAt: new Date().toISOString(),
+      };
+    } finally {
+      await auth.cleanup();
+    }
+  }
+
+  async publish(contribution: Contribution, repository: ContributionRepository): Promise<Contribution> {
+    if (contribution.status === 'published') return contribution;
+    if (contribution.status !== 'ready') throw new ContributionError(`Contribution is ${contribution.status}, not ready for approval.`, 409);
+    if (!contribution.preparedCommitSha || !contribution.commitMessage) throw new ContributionError('Ready contribution metadata is incomplete.', 409);
+    if (!contribution.branch.startsWith(repository.branchPrefix) || contribution.branch === repository.defaultBranch) {
+      throw new ContributionError('Contribution branch violates repository policy.');
+    }
+
+    const checkout = this.checkoutPath(contribution);
+    const expectedRemote = providerRemote(repository);
+    const configuredRemote = (await this.git(checkout, ['remote', 'get-url', 'origin'])).stdout.trim();
+    if (configuredRemote !== expectedRemote) throw new ContributionError('Checkout remote changed after approval was requested.', 409);
+    const head = (await this.git(checkout, ['rev-parse', 'HEAD'])).stdout.trim();
+    const currentBranch = (await this.git(checkout, ['branch', '--show-current'])).stdout.trim();
+    const worktree = (await this.git(checkout, ['status', '--porcelain=v1', '--untracked-files=all'])).stdout.trim();
+    if (head !== contribution.preparedCommitSha || currentBranch !== contribution.branch || worktree) {
+      throw new ContributionError('Checkout changed after approval was requested; prepare a new contribution.', 409);
+    }
+
+    const auth = await this.authEnvironment(repository);
+    try {
+      const remoteBase = (await this.git(checkout, ['ls-remote', '--exit-code', 'origin', `refs/heads/${repository.defaultBranch}`], auth.env)).stdout.trim().split(/\s+/)[0];
+      if (remoteBase !== contribution.baseSha) throw new ContributionError('The remote default branch changed after preparation; prepare a new contribution.', 409);
+      const remoteBranch = (await this.git(checkout, ['ls-remote', 'origin', `refs/heads/${contribution.branch}`], auth.env)).stdout.trim();
+      if (remoteBranch) throw new ContributionError('The generated contribution branch already exists remotely.', 409);
       await this.git(checkout, ['push', '--porcelain', 'origin', `HEAD:refs/heads/${contribution.branch}`], auth.env);
       const urls = publicUrls(repository, contribution.branch);
       return {
         ...contribution,
         ...urls,
         status: 'published',
-        publishedSha,
-        validationSummary: `${changed.length} file(s), ${changedBytes} byte(s) validated and pushed.`,
+        publishedSha: contribution.preparedCommitSha,
+        validationSummary: `${contribution.changedFiles?.length ?? 0} file(s), ${contribution.changedBytes ?? 0} byte(s) validated and pushed after operator approval.`,
         updatedAt: new Date().toISOString(),
       };
     } finally {
@@ -250,6 +294,7 @@ export class ContributionRuntime {
   }
 
   async abort(contribution: Contribution): Promise<Contribution> {
+    if (contribution.status === 'aborted') return contribution;
     if (contribution.status === 'published') throw new ContributionError('Published contributions cannot be aborted.', 409);
     await rm(this.checkoutPath(contribution), { recursive: true, force: true });
     return { ...contribution, status: 'aborted', updatedAt: new Date().toISOString() };

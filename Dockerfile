@@ -29,3 +29,17 @@ ENV NODE_ENV=production \
 EXPOSE 8080
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "--experimental-strip-types", "server/index.ts"]
+
+FROM alpine:3.22 AS backup
+
+RUN apk add --no-cache docker-cli restic tzdata util-linux-misc
+
+COPY backup/fleet-backup.sh /usr/local/bin/fleet-backup
+COPY backup/entrypoint.sh /usr/local/bin/fleet-backup-entrypoint
+COPY backup/crontab /etc/crontabs/root
+
+RUN chmod 0755 /usr/local/bin/fleet-backup /usr/local/bin/fleet-backup-entrypoint \
+    && chmod 0600 /etc/crontabs/root
+
+ENTRYPOINT ["/usr/local/bin/fleet-backup-entrypoint"]
+CMD ["schedule"]

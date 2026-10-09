@@ -12,7 +12,7 @@ function usage() {
   fleet-contribute list
   fleet-contribute prepare <repository-alias> [--request-id <id>]
   fleet-contribute status [contribution-id]
-  fleet-contribute publish <contribution-id> --base <sha> --message <message>
+  fleet-contribute ready <contribution-id> --base <sha> --message <message>
   fleet-contribute abort <contribution-id>
 `);
 }
@@ -86,10 +86,11 @@ try {
     requestId: option('--request-id') || `cli-${Date.now()}`,
   });
   else if (command === 'status') result = await request('GET', subject ? `/contributions/${encodeURIComponent(subject)}` : '/contributions');
-  else if (command === 'publish' && subject && option('--base') && option('--message')) result = await request('POST', `/contributions/${encodeURIComponent(subject)}/publish`, {
+  else if (command === 'ready' && subject && option('--base') && option('--message')) result = await request('POST', `/contributions/${encodeURIComponent(subject)}/ready`, {
     expectedBaseSha: option('--base'),
     message: option('--message'),
   });
+  else if (command === 'publish') throw new Error('Publishing requires operator approval through the Fleet review link returned by fleet-contribute ready.');
   else if (command === 'abort' && subject) result = await request('POST', `/contributions/${encodeURIComponent(subject)}/abort`, {});
   else { usage(); process.exitCode = 2; }
   if (result) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

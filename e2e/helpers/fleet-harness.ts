@@ -69,6 +69,7 @@ export async function startFleetHarness(extraEnv: NodeJS.ProcessEnv = {}): Promi
       FLEET_UI_DIR: path.join(process.cwd(), 'dist'),
       FLEET_BIND_HOST: '127.0.0.1',
       FLEET_PORT: String(port),
+      FLEET_PUBLIC_URL: baseUrl,
       FLEET_DOCKER_ENABLED: 'false',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

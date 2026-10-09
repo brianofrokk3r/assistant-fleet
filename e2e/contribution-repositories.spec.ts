@@ -130,19 +130,19 @@ test('rendered state and Compose never contain a resolved remote credential', as
   const skill = await readFile(path.join(
     fleet.root, 'rendered-skillsets', 'contribution-e2e', 'fleet-contribute', 'SKILL.md',
   ), 'utf8');
-  expect(skill).toContain('For a requested repository change, publish the validated result');
-  expect(skill).toContain('does not disable this brokered command');
-  expect(skill).toContain('unless the user explicitly requested local-only work, no push, or confirmation before publishing');
+  expect(skill).toContain('fleet-contribute ready <id>');
+  expect(skill).toContain('has no external write side effect');
+  expect(skill).toContain('Only the human action behind the approval URL');
 
   const prompt = await readFile(path.join(fleet.root, 'tenants', 'contribution-e2e', 'prompt.md'), 'utf8');
-  expect(prompt).toContain('completion includes publishing the validated generated branch');
-  expect(prompt).toContain('The workflow does not create or merge a pull request.');
+  expect(prompt).toContain('Return the resulting approval URL to the user.');
+  expect(prompt).toContain('The agent must never publish directly');
 
   const persisted = await readFile(path.join(fleet.root, 'data', 'state.json'), 'utf8');
   expect(persisted).not.toContain('e2e-token-must-never-be-rendered');
 });
 
-test('prepare isolates concurrent contributions and publish cannot target main', async ({ request }) => {
+test('prepare isolates concurrent contributions and sandbox publishing is unavailable', async ({ request }) => {
   const repository = await request.post(`${fleet.baseUrl}/api/contribution-repositories`, {
     data: contributionRepository({
       alias: 'isolated-checkouts', provider: 'local', remote: localRemote, credentialRef: '',
@@ -169,10 +169,11 @@ test('prepare isolates concurrent contributions and publish cannot target main',
   const publish = await request.post(`${fleet.baseUrl}/api/deployments/contribution-e2e/contributions/${a.contribution.id}/publish`, {
     data: { branch: 'main', expectedBaseSha: '0'.repeat(40), message: 'Unsafe target' },
   });
-  expect(publish.status()).toBe(422);
+  expect(publish.status()).toBe(403);
+  expect(await publish.text()).toContain('operator approval');
 });
 
-test('publishes a README-only branch without changing the default branch and reconciles retries', async ({ request }) => {
+test('operator approval publishes the frozen README-only commit and reconciles retries', async ({ page, request }) => {
   const repository = await request.post(`${fleet.baseUrl}/api/contribution-repositories`, {
     data: contributionRepository({
       alias: 'local-publish', provider: 'local', remote: localRemote, credentialRef: '',
@@ -197,24 +198,36 @@ test('publishes a README-only branch without changing the default branch and rec
     expectedBaseSha: prepared.contribution.baseSha,
     message: 'docs: validate contribution publishing',
   };
-  const publish = await request.post(
-    `${fleet.baseUrl}/api/deployments/contribution-e2e/contributions/${prepared.contribution.id}/publish`,
-    { data: payload },
-  );
+  const socket = path.join(fleet.root, 'tenants', 'contribution-e2e', 'workspace', '.fleet-contribution', 'broker.sock');
+  const ready = await run(process.execPath, [
+    'runtime/fleet-contribute.mjs', 'ready', prepared.contribution.id,
+    '--base', payload.expectedBaseSha, '--message', payload.message,
+  ], { cwd: process.cwd(), env: { ...process.env, FLEET_CONTRIBUTION_SOCKET: socket } });
+  const readyResult = JSON.parse(ready.stdout) as { contribution: { status: string; preparedCommitSha: string }; approvalUrl: string };
+  expect(readyResult.contribution.status).toBe('ready');
+  expect(readyResult.approvalUrl).toMatch(new RegExp(`^${fleet.baseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/contributions/approve/`));
+  await expect(run('git', [`--git-dir=${localRemote}`, 'rev-parse', `refs/heads/${prepared.contribution.branch}`])).rejects.toThrow();
+
+  await page.goto(readyResult.approvalUrl);
+  await expect(page.getByRole('heading', { name: 'local-publish' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Publish branch' })).toBeVisible();
+
+  const token = new URL(readyResult.approvalUrl).pathname.split('/').at(-1)!;
+  const stateAfterReady = await (await request.get(`${fleet.baseUrl}/api/state`)).text();
+  expect(stateAfterReady).not.toContain(token);
+  expect(stateAfterReady).not.toContain('approvalTokenHash');
+  const publish = await request.post(`${fleet.baseUrl}/api/contribution-approvals/${token}/publish`, { data: {} });
   expect(publish.status()).toBe(200);
-  const result = await publish.json() as { contribution: { publishedSha: string; status: string } };
-  expect(result.contribution.status).toBe('published');
+  const result = await publish.json() as { approval: { publishedSha: string; status: string; pullRequestUrl?: string } };
+  expect(result.approval.status).toBe('published');
   const main = (await run('git', [`--git-dir=${localRemote}`, 'rev-parse', 'refs/heads/main'])).stdout.trim();
   const branch = (await run('git', [
     `--git-dir=${localRemote}`, 'rev-parse', `refs/heads/${prepared.contribution.branch}`,
   ])).stdout.trim();
   expect(main).toBe(prepared.contribution.baseSha);
-  expect(branch).toBe(result.contribution.publishedSha);
+  expect(branch).toBe(result.approval.publishedSha);
 
-  const retry = await request.post(
-    `${fleet.baseUrl}/api/deployments/contribution-e2e/contributions/${prepared.contribution.id}/publish`,
-    { data: payload },
-  );
+  const retry = await request.post(`${fleet.baseUrl}/api/contribution-approvals/${token}/publish`, { data: {} });
   expect(retry.status()).toBe(200);
-  expect((await retry.json() as { contribution: { publishedSha: string } }).contribution.publishedSha).toBe(branch);
+  expect((await retry.json() as { approval: { publishedSha: string } }).approval.publishedSha).toBe(branch);
 });

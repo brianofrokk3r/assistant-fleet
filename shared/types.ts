@@ -33,7 +33,7 @@ export interface ContributionRepository {
 
 export type ContributionRepositoryInput = Omit<ContributionRepository, 'id' | 'createdAt' | 'updatedAt'>;
 
-export type ContributionStatus = 'prepared' | 'published' | 'aborted' | 'failed';
+export type ContributionStatus = 'prepared' | 'ready' | 'published' | 'aborted' | 'failed';
 
 export interface Contribution {
   id: string;
@@ -48,11 +48,39 @@ export interface Contribution {
   status: ContributionStatus;
   createdAt: string;
   updatedAt: string;
+  commitMessage?: string;
+  preparedCommitSha?: string;
+  changedFiles?: string[];
+  changedBytes?: number;
+  /** SHA-256 of the opaque approval bearer token; the token itself is never persisted. */
+  approvalTokenHash?: string;
+  approvalExpiresAt?: string;
   publishedSha?: string;
   branchUrl?: string;
   pullRequestUrl?: string;
   validationSummary?: string;
   failureReason?: string;
+}
+
+export interface ContributionApproval {
+  id: string;
+  tenantId: string;
+  tenantName: string;
+  repositoryAlias: string;
+  repositoryRemote: string;
+  defaultBranch: string;
+  branch: string;
+  baseSha: string;
+  status: ContributionStatus;
+  commitMessage?: string;
+  preparedCommitSha?: string;
+  changedFiles: string[];
+  changedBytes: number;
+  validationSummary?: string;
+  approvalExpiresAt: string;
+  branchUrl?: string;
+  pullRequestUrl?: string;
+  publishedSha?: string;
 }
 
 export interface SecretEnvironmentVariable {
@@ -189,6 +217,33 @@ export interface OperationResult {
   deployment?: Deployment;
   output?: string;
   error?: string;
+}
+
+export type BackupState = 'unavailable' | 'idle' | 'running' | 'verifying' | 'restoring' | 'success' | 'failed';
+
+export interface BackupSnapshot {
+  id: string;
+  shortId: string;
+  time: string;
+  hostname: string;
+  fileCount: number;
+  totalBytes: number;
+  restorable: boolean;
+}
+
+export interface BackupStatus {
+  state: BackupState;
+  operation: 'none' | 'backup' | 'verify' | 'restore';
+  message: string;
+  updatedAt: string;
+  lastAttempt: string;
+  lastSuccess: string;
+  lastRestore: string;
+  restoreTarget: string;
+  durationSeconds: number | null;
+  containerState: 'not-created' | 'stopped' | 'running';
+  schedule: string;
+  destination: string;
 }
 
 export interface ValidationResult {

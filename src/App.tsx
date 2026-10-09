@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
-  Activity, Box, Check, ChevronDown, ChevronRight, CircleAlert,
+  Activity, ArchiveRestore, Box, Check, ChevronDown, ChevronRight, CircleAlert,
   Clock3, Copy, Database, Download, ExternalLink, FileText, FolderGit2, HardDrive, Hexagon,
   GitBranch, Layers3, MoreHorizontal, Pause, Pencil, Plus, RefreshCw, RotateCcw, Search,
   Server, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2, Users, X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { type ActivityRecord, type AdapterType, type ContributionRepository, type ContributionRepositoryInput, type Deployment, type DeploymentStatus, type ProviderType, type RepositorySnapshot, type TenantConfiguration } from '../shared/types';
+import { type ActivityRecord, type AdapterType, type BackupSnapshot, type BackupStatus, type ContributionApproval, type ContributionRepository, type ContributionRepositoryInput, type Deployment, type DeploymentStatus, type ProviderType, type RepositorySnapshot, type TenantConfiguration } from '../shared/types';
 import { fleetApi } from './api';
 
 type PageName = 'deployments' | 'activity' | 'repositories' | 'access' | 'settings' | 'contract';
@@ -104,6 +104,71 @@ function Metric({ icon: Icon, value, label, tone }: { icon: LucideIcon; value: R
     <div className="metric-card">
       <div className={`metric-icon ${tone}`}><Icon size={18} /></div>
       <div><strong>{value}</strong><span>{label}</span></div>
+    </div>
+  );
+}
+
+function BackupPanel({ backup, snapshots, pending, onRun, onVerify, onRestore }: { backup: BackupStatus | null; snapshots: BackupSnapshot[]; pending: 'run' | 'verify' | 'restore' | null; onRun: () => void; onVerify: () => void; onRestore: (snapshotId: string) => void }) {
+  const safeSnapshots = snapshots.filter(snapshot => snapshot.restorable);
+  const [selectedId, setSelectedId] = useState('');
+  const selected = safeSnapshots.find(snapshot => snapshot.id === selectedId) ?? safeSnapshots[0];
+  const busy = pending !== null || backup?.state === 'running' || backup?.state === 'verifying' || backup?.state === 'restoring';
+  const available = backup?.containerState === 'running';
+  const tone = backup?.state === 'success' ? 'healthy' : backup?.state === 'running' || backup?.state === 'verifying' || backup?.state === 'restoring' ? 'deploying' : backup?.state === 'failed' ? 'attention' : 'suspended';
+  const label = backup?.state === 'success' ? 'Protected' : backup?.state === 'running' ? 'Backing up' : backup?.state === 'verifying' ? 'Verifying' : backup?.state === 'restoring' ? 'Restoring' : backup?.state === 'failed' ? 'Failed' : available ? 'Waiting' : 'Unavailable';
+  const formatTime = (value: string | undefined, fallback: string) => value
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short', timeZone: 'America/New_York' }).format(new Date(value))
+    : fallback;
+  const formatBytes = (value: number) => value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GB` : `${Math.max(1, Math.round(value / 1024 ** 2))} MB`;
+  const lastSuccess = formatTime(backup?.lastSuccess, 'No successful backup yet');
+  const lastAttempt = formatTime(backup?.lastAttempt, 'Not attempted');
+  return (
+    <div className="backup-page">
+      <div className="metrics compact-metrics backup-metrics">
+        <Metric icon={ShieldCheck} value={label} label="Backup status" tone={backup?.state === 'failed' ? 'amber' : 'green'} />
+        <Metric icon={Clock3} value="10:00 AM" label="Daily · Eastern time" tone="indigo" />
+        <Metric icon={Database} value={safeSnapshots.length} label={safeSnapshots.length === 1 ? 'Recovery point' : 'Recovery points'} tone="slate" />
+      </div>
+      <div className="backup-content-grid">
+        <section className="subpage-card backup-overview">
+          <div className="backup-overview-head">
+            <div className="backup-title"><div className="metric-icon green"><HardDrive size={19} /></div><div><b>Assistant Fleet backups</b><span>Incremental, encrypted snapshots of Fleet state and every tenant data volume</span></div></div>
+            <span className={`status-pill ${tone}`}><i />{label}</span>
+          </div>
+          <div className={`backup-message ${backup?.state === 'failed' || backup?.state === 'unavailable' ? 'warning' : ''}`}>
+            {backup?.state === 'running' || backup?.state === 'verifying' || backup?.state === 'restoring' ? <RefreshCw className="spin" size={17} /> : backup?.state === 'failed' || backup?.state === 'unavailable' ? <CircleAlert size={17} /> : <ShieldCheck size={17} />}
+            <span>{backup?.message ?? 'Loading backup status…'}</span>
+          </div>
+          <dl className="backup-facts">
+            <div><dt>Last successful backup</dt><dd>{lastSuccess}</dd></div>
+            <div><dt>Last attempt</dt><dd>{lastAttempt}</dd></div>
+            <div><dt>Duration</dt><dd>{backup?.durationSeconds != null ? `${backup.durationSeconds} seconds` : '—'}</dd></div>
+            <div><dt>Schedule</dt><dd>{backup?.schedule ?? 'Daily at 10:00 AM ET'}</dd></div>
+            <div><dt>Destination</dt><dd><code title={backup?.destination}>{backup?.destination ?? './fleet-backups'}</code></dd></div>
+            <div><dt>Retention</dt><dd>7 daily · 5 weekly · 6 monthly</dd></div>
+          </dl>
+          <div className="backup-page-actions">
+            <button className="secondary-button" disabled={!available || busy || !backup?.lastSuccess} onClick={onVerify}><ShieldCheck size={15} />{pending === 'verify' || backup?.state === 'verifying' ? 'Verifying…' : 'Verify backup'}</button>
+            <button className="primary-button" disabled={!available || busy} onClick={onRun}><RefreshCw className={backup?.state === 'running' ? 'spin' : ''} size={15} />{pending === 'run' || backup?.state === 'running' ? 'Backing up…' : 'Back up now'}</button>
+          </div>
+        </section>
+
+        <section className="subpage-card backup-recovery">
+          <div className="backup-recovery-head"><div className="metric-icon indigo"><ArchiveRestore size={19} /></div><div><b>Restore a recovery point</b><span>Files are restored to a new staging folder. Live tenants are never overwritten.</span></div></div>
+          <div className="snapshot-list">
+            {safeSnapshots.map((snapshot, index) => <button className={`snapshot-option ${selected?.id === snapshot.id ? 'selected' : ''}`} key={snapshot.id} onClick={() => setSelectedId(snapshot.id)}>
+              <span className="snapshot-radio"><i /></span>
+              <span className="snapshot-copy"><b>{formatTime(snapshot.time, 'Unknown time')}{index === 0 && <em>Latest</em>}</b><small><code>{snapshot.shortId}</code> · {snapshot.fileCount.toLocaleString()} files · {formatBytes(snapshot.totalBytes)}</small></span>
+            </button>)}
+            {!safeSnapshots.length && <div className="snapshot-empty"><ArchiveRestore size={24} /><b>No safe recovery points</b><span>Complete a backup before restoring.</span></div>}
+          </div>
+          {backup?.restoreTarget && <div className="restore-result"><Check size={15} /><span><b>Last restored files</b><code title={backup.restoreTarget}>{backup.restoreTarget}</code></span></div>}
+          <div className="restore-actions">
+            <span>Restore creates a copy for inspection.</span>
+            <button className="primary-button" disabled={!available || busy || !selected} onClick={() => selected && onRestore(selected.id)}><ArchiveRestore className={backup?.state === 'restoring' ? 'spin' : ''} size={15} />{pending === 'restore' || backup?.state === 'restoring' ? 'Restoring…' : 'Restore selected'}</button>
+          </div>
+        </section>
+      </div>
     </div>
   );
 }
@@ -407,11 +472,17 @@ interface RepositoriesPageProps {
   onAddRepository: (tenantId: string, repository: RepositorySnapshot) => void;
   onSaveContributionRepository: (repository: ContributionRepositoryInput, id?: string) => Promise<void>;
   onDeleteContributionRepository: (repository: ContributionRepository) => Promise<void>;
+  backup: BackupStatus | null;
+  backupSnapshots: BackupSnapshot[];
+  backupPending: 'run' | 'verify' | 'restore' | null;
+  onRunBackup: () => void;
+  onVerifyBackup: () => void;
+  onRestoreBackup: (snapshotId: string) => void;
 }
 
-function RepositoriesPage({ deployments, contributionRepositories, onSelectTenant, onAddRepository, onSaveContributionRepository, onDeleteContributionRepository }: RepositoriesPageProps) {
+function RepositoriesPage({ deployments, contributionRepositories, onSelectTenant, onAddRepository, onSaveContributionRepository, onDeleteContributionRepository, backup, backupSnapshots, backupPending, onRunBackup, onVerifyBackup, onRestoreBackup }: RepositoriesPageProps) {
   const repos = deployments.flatMap(tenant => tenant.repositoryList.map(repo => ({ ...repo, tenant })));
-  const [tab, setTab] = useState<'knowledge' | 'contributions'>('knowledge');
+  const [tab, setTab] = useState<'knowledge' | 'contributions' | 'backups'>('knowledge');
   const [copiedRepo, setCopiedRepo] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [snapshotForm, setSnapshotForm] = useState({ tenantId: deployments[0]?.id || '', name: '', revision: '' });
@@ -444,13 +515,16 @@ function RepositoriesPage({ deployments, contributionRepositories, onSelectTenan
   const assigned = (repository: ContributionRepository) => deployments.filter(tenant => repository.assignedTenants.includes(tenant.id));
   return (
     <div className="page subpage">
-      <PageHeading eyebrow="CODE & KNOWLEDGE" title="Repositories" description={tab === 'knowledge' ? 'Track immutable, tenant-scoped snapshots mounted read-only.' : 'Assign multiple writable contribution repositories to each assistant.'} action={
-        <button className="primary-button" onClick={() => adding ? setAdding(false) : tab === 'knowledge' ? setAdding(true) : openAdd()}>{adding ? <X size={16} /> : <Plus size={16} />}{adding ? 'Cancel' : tab === 'knowledge' ? 'Add snapshot' : 'Add contribution repository'}</button>
+      <PageHeading eyebrow={tab === 'backups' ? 'RECOVERY' : 'CODE & KNOWLEDGE'} title={tab === 'backups' ? 'Backups' : 'Repositories'} description={tab === 'knowledge' ? 'Track immutable, tenant-scoped snapshots mounted read-only.' : tab === 'contributions' ? 'Assign multiple writable contribution repositories to each assistant.' : 'Monitor and manage encrypted recovery points for the entire local fleet.'} action={tab !== 'backups' ?
+        <button className="primary-button" onClick={() => adding ? setAdding(false) : tab === 'knowledge' ? setAdding(true) : openAdd()}>{adding ? <X size={16} /> : <Plus size={16} />}{adding ? 'Cancel' : tab === 'knowledge' ? 'Add snapshot' : 'Add contribution repository'}</button> : undefined
       } />
       <div className="repository-tabs" role="tablist" aria-label="Repository type">
         <button role="tab" aria-selected={tab === 'knowledge'} className={tab === 'knowledge' ? 'active' : ''} onClick={() => { setTab('knowledge'); setAdding(false); }}><Database size={16} />Knowledge snapshots <span>{repos.length}</span></button>
         <button role="tab" aria-selected={tab === 'contributions'} className={tab === 'contributions' ? 'active' : ''} onClick={() => { setTab('contributions'); setAdding(false); }}><GitBranch size={16} />Contribution repositories <span>{contributionRepositories.length}</span></button>
+        <button role="tab" aria-selected={tab === 'backups'} className={tab === 'backups' ? 'active' : ''} onClick={() => { setTab('backups'); setAdding(false); }}><HardDrive size={16} />Backups <span className={`backup-tab-dot ${backup?.state === 'success' ? 'healthy' : backup?.state === 'failed' ? 'failed' : ''}`} /></button>
       </div>
+
+      {tab === 'backups' && <BackupPanel backup={backup} snapshots={backupSnapshots} pending={backupPending} onRun={onRunBackup} onVerify={onVerifyBackup} onRestore={onRestoreBackup} />}
 
       {tab === 'knowledge' && <>
         {adding && <div className="snapshot-form">
@@ -584,7 +658,68 @@ function ContractPage() {
   return <div className="page subpage"><PageHeading eyebrow="ARCHITECTURE" title="Deployment contract" description="The operational boundaries every local tenant stack must preserve." /><div className="contract-grid">{rules.map(([title, text], index) => <div className="contract-rule" key={title}><span>{String(index + 1).padStart(2, '0')}</span><div><b>{title}</b><p>{text}</p></div><Check size={17} /></div>)}</div></div>;
 }
 
-export default function App() {
+function ApprovalPage({ token }: { token: string }) {
+  const [approval, setApproval] = useState<ContributionApproval | null>(null);
+  const [error, setError] = useState('');
+  const [pending, setPending] = useState<'publish' | 'abort' | null>(null);
+  useEffect(() => {
+    void fleetApi.contributionApproval(token)
+      .then(result => setApproval(result.approval))
+      .catch(reason => setError(reason instanceof Error ? reason.message : String(reason)));
+  }, [token]);
+  const act = async (action: 'publish' | 'abort') => {
+    if (action === 'publish' && !window.confirm('Publish this exact validated commit to the generated contribution branch?')) return;
+    if (action === 'abort' && !window.confirm('Abort this contribution and remove its isolated checkout?')) return;
+    setPending(action); setError('');
+    try {
+      const result = action === 'publish'
+        ? await fleetApi.publishContributionApproval(token)
+        : await fleetApi.abortContributionApproval(token);
+      setApproval(result.approval);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally { setPending(null); }
+  };
+  const bytes = approval ? new Intl.NumberFormat().format(approval.changedBytes) : '0';
+  return (
+    <main className="approval-shell">
+      <section className="approval-card">
+        <div className="approval-brand"><BrandMark /><div><span>ASSISTANT FLEET</span><b>Contribution approval</b></div></div>
+        {error && !approval && <div className="approval-state error"><CircleAlert size={24} /><h1>Approval unavailable</h1><p>{error}</p></div>}
+        {!error && !approval && <div className="approval-state"><RefreshCw className="spin" size={24} /><h1>Loading contribution</h1></div>}
+        {approval && <>
+          <div className="approval-heading">
+            <span className={`approval-status ${approval.status}`}>{approval.status === 'ready' ? 'Ready for review' : approval.status}</span>
+            <h1>{approval.repositoryAlias}</h1>
+            <p>{approval.repositoryRemote} · {approval.tenantName}</p>
+          </div>
+          <dl className="approval-facts">
+            <div><dt>Target branch</dt><dd><code>{approval.defaultBranch}</code></dd></div>
+            <div><dt>Contribution branch</dt><dd><code>{approval.branch}</code></dd></div>
+            <div><dt>Commit</dt><dd><code>{approval.preparedCommitSha?.slice(0, 12) ?? 'Pending'}</code></dd></div>
+            <div><dt>Commit message</dt><dd>{approval.commitMessage ?? '—'}</dd></div>
+            <div><dt>Validated change</dt><dd>{approval.changedFiles.length} file(s) · {bytes} bytes</dd></div>
+            <div><dt>Approval expires</dt><dd>{new Date(approval.approvalExpiresAt).toLocaleString()}</dd></div>
+          </dl>
+          <div className="approval-files">
+            <span>Changed files</span>
+            {approval.changedFiles.map(file => <code key={file}>{file}</code>)}
+          </div>
+          {approval.validationSummary && <div className="approval-validation"><ShieldCheck size={17} /><span>{approval.validationSummary}</span></div>}
+          {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
+          {approval.status === 'ready' && <div className="approval-actions">
+            <button className="secondary-button" disabled={pending !== null} onClick={() => void act('abort')}>{pending === 'abort' ? 'Aborting…' : 'Abort'}</button>
+            <button className="primary-button" disabled={pending !== null} onClick={() => void act('publish')}><GitBranch size={16} />{pending === 'publish' ? 'Publishing…' : 'Publish branch'}</button>
+          </div>}
+          {approval.status === 'published' && <div className="approval-result"><Check size={22} /><div><b>Branch published</b><span>The reviewed commit was pushed successfully.</span></div>{approval.pullRequestUrl && <a href={approval.pullRequestUrl} target="_blank" rel="noreferrer">Open pull request <ExternalLink size={15} /></a>}</div>}
+          {approval.status === 'aborted' && <div className="approval-result aborted"><X size={22} /><div><b>Contribution aborted</b><span>No remote branch was created.</span></div></div>}
+        </>}
+      </section>
+    </main>
+  );
+}
+
+function FleetConsole() {
   const [deployments, setDeployments] = useState<Deployment[]>(readStored);
   const [contributionRepositories, setContributionRepositories] = useState<ContributionRepository[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>('acme');
@@ -597,6 +732,9 @@ export default function App() {
   const [pageName, setPageName] = useState<PageName>('deployments');
   const [apiConnected, setApiConnected] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<{ tone: 'error' | 'success'; message: string } | null>(null);
+  const [backup, setBackup] = useState<BackupStatus | null>(null);
+  const [backupSnapshots, setBackupSnapshots] = useState<BackupSnapshot[]>([]);
+  const [backupPending, setBackupPending] = useState<'run' | 'verify' | 'restore' | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -619,6 +757,40 @@ export default function App() {
     const interval = window.setInterval(load, 15_000);
     return () => { active = false; window.clearInterval(interval); };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const result = await fleetApi.backupStatus();
+        if (active) setBackup(result.backup);
+      } catch (error) {
+        if (active) setBackup({
+          state: 'unavailable', operation: 'none', containerState: 'not-created',
+          message: error instanceof Error ? error.message : String(error), updatedAt: '', lastAttempt: '', lastSuccess: '', lastRestore: '', restoreTarget: '', durationSeconds: null,
+          schedule: 'Daily at 10:00 AM ET', destination: './fleet-backups',
+        });
+      }
+      try {
+        const result = await fleetApi.backupSnapshots();
+        if (active) setBackupSnapshots(result.snapshots);
+      } catch { if (active) setBackupSnapshots([]); }
+    };
+    void load();
+    const interval = window.setInterval(load, 5_000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, []);
+
+  const runBackupAction = async (action: 'run' | 'verify' | 'restore', snapshotId?: string) => {
+    setBackupPending(action);
+    try {
+      const result = action === 'run' ? await fleetApi.runBackup() : action === 'verify' ? await fleetApi.verifyBackup() : await fleetApi.restoreBackup(snapshotId || '');
+      setBackup(result.backup);
+      setNotice({ tone: 'success', message: action === 'run' ? 'Backup started.' : action === 'verify' ? 'Backup verification started.' : 'Restore started in a safe staging folder.' });
+    } catch (error) {
+      setNotice({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
+    } finally { setBackupPending(null); }
+  };
 
   const refreshState = async () => {
     const state = await fleetApi.state();
@@ -770,7 +942,7 @@ export default function App() {
         </div>
         }
         {pageName === 'activity' && <ActivityPage activity={activity} deployments={deployments} />}
-        {pageName === 'repositories' && <RepositoriesPage deployments={deployments} contributionRepositories={contributionRepositories} onSelectTenant={openTenant} onAddRepository={addRepository} onSaveContributionRepository={saveContributionRepository} onDeleteContributionRepository={deleteContributionRepository} />}
+        {pageName === 'repositories' && <RepositoriesPage deployments={deployments} contributionRepositories={contributionRepositories} onSelectTenant={openTenant} onAddRepository={addRepository} onSaveContributionRepository={saveContributionRepository} onDeleteContributionRepository={deleteContributionRepository} backup={backup} backupSnapshots={backupSnapshots} backupPending={backupPending} onRunBackup={() => void runBackupAction('run')} onVerifyBackup={() => void runBackupAction('verify')} onRestoreBackup={snapshotId => void runBackupAction('restore', snapshotId)} />}
         {pageName === 'access' && <AccessPage deployments={deployments} onSelectTenant={openTenant} />}
         {pageName === 'settings' && <SettingsPage deployments={deployments} contributionRepositories={contributionRepositories} onOpenContract={() => navigate('contract')} />}
         {pageName === 'contract' && <ContractPage />}
@@ -780,4 +952,9 @@ export default function App() {
       {showNew && <NewDeployment initial={editingConfiguration ?? undefined} onClose={() => { setShowNew(false); setEditingConfiguration(null); }} onCreate={createDeployment} />}
     </div>
   );
+}
+
+export default function App() {
+  const match = window.location.pathname.match(/^\/contributions\/approve\/([A-Za-z0-9_-]{43})$/);
+  return match ? <ApprovalPage token={match[1]} /> : <FleetConsole />;
 }

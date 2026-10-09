@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { chmod, chown, lstat, mkdir, readFile, rename, stat, writeFile, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
@@ -9,7 +10,10 @@ import {
   validateContributionRepository,
   validateTenantConfiguration,
   type ActivityRecord,
+  type BackupSnapshot,
+  type BackupStatus,
   type Contribution,
+  type ContributionApproval,
   type ContributionRepository,
   type ContributionRepositoryInput,
   type Deployment,
@@ -33,7 +37,14 @@ const bindHost = process.env.FLEET_BIND_HOST || '127.0.0.1';
 const serveStatic = process.env.FLEET_SERVE_STATIC !== 'false';
 const dockerEnabled = process.env.FLEET_DOCKER_ENABLED !== 'false';
 const allowLocalContributionRemotes = process.env.FLEET_E2E_ALLOW_LOCAL_REMOTES === 'true';
+const publicUrl = (process.env.FLEET_PUBLIC_URL || `http://127.0.0.1:${port}`).replace(/\/+$/, '');
+const backupDestination = process.env.FLEET_BACKUP_DESTINATION || './fleet-backups';
+const approvalTtlMs = Number(process.env.FLEET_CONTRIBUTION_APPROVAL_TTL_MS || 86_400_000);
 const maxOutputBytes = 512_000;
+
+if (!Number.isSafeInteger(approvalTtlMs) || approvalTtlMs < 60_000 || approvalTtlMs > 7 * 86_400_000) {
+  throw new Error('FLEET_CONTRIBUTION_APPROVAL_TTL_MS must be between 60000 and 604800000.');
+}
 
 const emptyState = (): FleetState => ({ deployments: [], activities: [], contributionRepositories: [], contributions: [] });
 
@@ -187,7 +198,7 @@ async function renderContributionSkill(skillDir: string, repositories: Contribut
   const aliases = repositories.map(repository => `- \`${repository.alias}\` (base \`${repository.defaultBranch}\`, branches \`${repository.branchPrefix}*\`)`).join('\n');
   const skill = `---
 name: fleet-contribute
-description: Inspect or change repositories assigned by Assistant Fleet using isolated checkouts and brokered contribution-branch publishing.
+description: Inspect or change repositories assigned by Assistant Fleet, validate an isolated contribution, and hand it to a human for publication approval.
 ---
 
 # Fleet contribution workflow
@@ -203,16 +214,16 @@ ${aliases}
 2. Run \`fleet-contribute prepare <alias>\`. The response contains the isolated \`workspacePath\`, contribution ID, generated branch, and pinned \`baseSha\`.
 3. Inspect, edit, and test only inside that exact workspace path.
 4. Review the diff and run checks appropriate to the repository and change.
-5. For a requested repository change, publish the validated result with \`fleet-contribute publish <id> --base <baseSha> --message "<message>"\`, unless the user explicitly requested local-only work, no push, or confirmation before publishing.
-6. Report the pushed branch and pull-request handoff URL. This workflow creates neither the pull request nor a merge.
+5. For a requested repository change, run \`fleet-contribute ready <id> --base <baseSha> --message "<message>"\`, unless the user explicitly requested local-only work or no publication request. This validates the diff, creates a local commit, freezes it for review, and returns an \`approvalUrl\`.
+6. Return the approval URL to the user and explain that no remote branch exists until a human reviews and publishes it in Fleet.
 
-## Publishing boundary
+## Approval boundary
 
-A request to implement or change the assigned repository authorizes pushing only the generated contribution branch through \`fleet-contribute publish\`. It does not authorize pushing another branch, creating or merging a pull request, or making unrelated external changes.
+A repository change request authorizes preparing a local contribution and creating its Fleet approval request. It does not authorize the agent to push any branch, create or merge a pull request, or make unrelated external changes.
 
-\`fleet-contribute publish\` delegates the authenticated push to the Fleet controller. A Slack session, a sandbox without direct network access, or an agent approval mode such as \`never\` does not disable this brokered command. Attempt the command and rely on its actual result. Do not claim that external publishing is disabled unless the command itself returns that error.
+\`fleet-contribute ready\` has no external write side effect: it records a validated local commit and creates a short-lived operator review link. It is permitted in shared Slack sessions. Do not run \`fleet-contribute publish\`; model-accessible publishing is intentionally disabled. Only the human action behind the approval URL can ask Fleet to push the frozen generated branch.
 
-If publishing fails, do not claim that a remote branch or pull request exists. Report the exact error and preserve the contribution for a later retry; do not repeatedly retry without new evidence that the failure condition changed.
+After \`ready\` succeeds, do not edit the checkout again. If readiness validation fails, report the exact error and preserve the contribution for a later retry. Never claim that a remote branch or pull request exists before the approval page reports a successful publication.
 
 Never read or request repository credentials. Never change the generated branch, base SHA, Git remote, hooks, protected paths, or files outside the isolated checkout.
 `;
@@ -229,7 +240,7 @@ async function renderContributionPrompt(promptFile: string, repositories: Contri
     return;
   }
   const aliases = repositories.map(repository => `\`${repository.alias}\``).join(', ');
-  const managedSection = `${start}\n## Contribution repositories\n\nAssigned aliases: ${aliases}.\n\nWhen a user asks you to inspect or change an assigned repository, use the \`fleet-contribute\` skill. Run \`fleet-contribute list\` and then \`fleet-contribute prepare <alias>\` before inspecting files. The alias directory under \`/data/workspaces/contributions\` is only a parent directory and is not itself a Git checkout. An empty parent directory does not mean repository access is unavailable. Use the exact \`workspacePath\`, contribution ID, generated branch, and base SHA returned by \`prepare\`.\n\nFor a requested repository change, completion includes publishing the validated generated branch with \`fleet-contribute publish\` and returning its pull-request handoff URL, unless the user explicitly requests local-only work, no push, or confirmation first. Publishing is brokered by Fleet; do not infer that it is disabled merely because the Slack/Codex sandbox lacks direct external network access. The workflow does not create or merge a pull request.\n${end}`;
+  const managedSection = `${start}\n## Contribution repositories\n\nAssigned aliases: ${aliases}.\n\nWhen a user asks you to inspect or change an assigned repository, use the \`fleet-contribute\` skill. Run \`fleet-contribute list\` and then \`fleet-contribute prepare <alias>\` before inspecting files. The alias directory under \`/data/workspaces/contributions\` is only a parent directory and is not itself a Git checkout. An empty parent directory does not mean repository access is unavailable. Use the exact \`workspacePath\`, contribution ID, generated branch, and base SHA returned by \`prepare\`.\n\nFor a requested repository change, validate it and run \`fleet-contribute ready <id> --base <baseSha> --message "<message>"\`. Return the resulting approval URL to the user. Readiness creates only a frozen local commit and a short-lived Fleet review link, so it is permitted in a shared Slack session. The agent must never publish directly; only a human action on the Fleet approval page may push the generated branch.\n${end}`;
   await writeFile(promptFile, `${withoutManagedSection}\n\n${managedSection}\n`, { mode: 0o644 });
 }
 
@@ -302,7 +313,7 @@ async function renderTenant(deployment: Deployment, contributionRepositories: Co
   const volumeDefinition = config.dataVolumeName
     ? `  assistant-data:\n    external: true\n    name: ${yaml(config.dataVolumeName)}`
     : '  assistant-data:';
-  const compose = `# Generated by Assistant Fleet. Edit deployment.json through the control plane.\nname: ${yaml(deployment.project)}\nservices:\n  data-init:\n    image: ${yaml(config.image)}\n    user: "0:0"\n    entrypoint: ["sh", "-c", ${yaml(initializeData)}]\n    restart: "no"\n    volumes:\n      - assistant-data:/data\n      - ${yaml(`${skillSource}:/managed-skills:ro`)}\n    read_only: true\n    cap_drop: [ALL]\n    cap_add: [CHOWN, DAC_OVERRIDE]\n    security_opt:\n      - no-new-privileges:true\n\n  assistant:\n    image: ${yaml(config.image)}\n    restart: unless-stopped\n    stop_grace_period: 11m\n    init: true\n    environment:\n${environmentYaml}\n    depends_on:\n      data-init:\n        condition: service_completed_successfully\n      browser:\n        condition: service_healthy\n    networks:\n      - default\n      - browser-control\n    extra_hosts:\n      - host.docker.internal:host-gateway\n    volumes:\n      - assistant-data:/data\n      - ${yaml('./prompt.md:/config/prompt.md:ro')}\n${workspaceVolume ? `${workspaceVolume}\n` : ''}${knowledgeVolumes.join('\n')}${knowledgeVolumes.length ? '\n' : ''}    read_only: true\n    tmpfs:\n      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001\n    cap_drop: [ALL]\n    security_opt:\n      - no-new-privileges:true\n      - seccomp=../../runtime/seccomp.json\n    pids_limit: 256\n\n  browser:\n    image: ${yaml(config.image)}\n    entrypoint: ["node", "/app/dist/src/browserWorker.js"]\n    restart: unless-stopped\n    init: true\n    mem_limit: 1g\n    memswap_limit: 1g\n    pids_limit: 256\n    read_only: true\n    tmpfs:\n      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001\n    cap_drop: [ALL]\n    security_opt:\n      - no-new-privileges:true\n      - seccomp=../../runtime/seccomp.json\n    healthcheck:\n      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3123/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]\n      interval: 10s\n      timeout: 3s\n      retries: 3\n    networks:\n      - browser-control\n      - browser-egress\n${relay}\nvolumes:\n${volumeDefinition}\n\nnetworks:\n  browser-control:\n    internal: true\n  browser-egress:\n`;
+  const compose = `# Generated by Assistant Fleet. Edit deployment.json through the control plane.\nname: ${yaml(deployment.project)}\nservices:\n  data-init:\n    image: ${yaml(config.image)}\n    user: "0:0"\n    entrypoint: ["sh", "-c", ${yaml(initializeData)}]\n    restart: "no"\n    volumes:\n      - assistant-data:/data\n      - ${yaml(`${skillSource}:/managed-skills:ro`)}\n    read_only: true\n    cap_drop: [ALL]\n    cap_add: [CHOWN, DAC_OVERRIDE]\n    security_opt:\n      - no-new-privileges:true\n\n  assistant:\n    image: ${yaml(config.image)}\n    restart: unless-stopped\n    stop_grace_period: 11m\n    init: true\n    environment:\n${environmentYaml}\n    depends_on:\n      data-init:\n        condition: service_completed_successfully\n      browser:\n        condition: service_healthy\n    networks:\n      - default\n      - browser-control\n    extra_hosts:\n      - host.docker.internal:host-gateway\n    volumes:\n      - assistant-data:/data\n      - ${yaml('./prompt.md:/config/prompt.md:ro')}\n${workspaceVolume ? `${workspaceVolume}\n` : ''}${knowledgeVolumes.join('\n')}${knowledgeVolumes.length ? '\n' : ''}    read_only: true\n    tmpfs:\n      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001\n    cap_drop: [ALL]\n    security_opt:\n      - no-new-privileges:true\n      - seccomp=../../runtime/seccomp.json\n    pids_limit: 512\n\n  browser:\n    image: ${yaml(config.image)}\n    entrypoint: ["node", "/app/dist/src/browserWorker.js"]\n    restart: unless-stopped\n    init: true\n    mem_limit: 1g\n    memswap_limit: 1g\n    pids_limit: 256\n    read_only: true\n    tmpfs:\n      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001\n    cap_drop: [ALL]\n    security_opt:\n      - no-new-privileges:true\n      - seccomp=../../runtime/seccomp.json\n    healthcheck:\n      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3123/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]\n      interval: 10s\n      timeout: 3s\n      retries: 3\n    networks:\n      - browser-control\n      - browser-egress\n${relay}\nvolumes:\n${volumeDefinition}\n\nnetworks:\n  browser-control:\n    internal: true\n  browser-egress:\n`;
   await Promise.all([
     writeFile(path.join(tenantDir, 'compose.generated.yaml'), compose, { mode: 0o600 }),
     writeFile(path.join(tenantDir, 'deployment.json'), `${JSON.stringify(deployment, null, 2)}\n`, { mode: 0o600 }),
@@ -351,6 +362,125 @@ async function runCompose(deployment: Deployment, args: string[], timeoutMs?: nu
   return result;
 }
 
+const unavailableBackupStatus = (message: string, containerState: BackupStatus['containerState'] = 'not-created'): BackupStatus => ({
+  state: 'unavailable',
+  operation: 'none',
+  message,
+  updatedAt: '',
+  lastAttempt: '',
+  lastSuccess: '',
+  lastRestore: '',
+  restoreTarget: '',
+  durationSeconds: null,
+  containerState,
+  schedule: 'Daily at 10:00 AM ET',
+  destination: backupDestination,
+});
+
+async function backupContainer(): Promise<{ id: string; running: boolean } | undefined> {
+  if (!dockerEnabled) return undefined;
+  const result = await runCommand('docker', [
+    'ps', '-a',
+    '--filter', 'label=com.docker.compose.service=fleet-backup',
+    '--format', '{{.ID}}\t{{.Label "com.docker.compose.project.working_dir"}}',
+  ], { cwd: projectRoot, timeoutMs: 15_000 });
+  if (result.code !== 0) throw new Error((result.stderr || result.stdout || 'Unable to inspect the backup service.').trim());
+  const match = result.stdout.trim().split('\n').map(line => line.split('\t')).find(([, directory]) => directory === projectRoot);
+  if (!match?.[0]) return undefined;
+  const inspected = await runCommand('docker', ['inspect', '--format', '{{.State.Running}}', match[0]], { cwd: projectRoot, timeoutMs: 15_000 });
+  return { id: match[0], running: inspected.stdout.trim() === 'true' };
+}
+
+async function readBackupStatus(): Promise<BackupStatus> {
+  if (!dockerEnabled) return unavailableBackupStatus('Docker operations are disabled.');
+  const container = await backupContainer();
+  if (!container) return unavailableBackupStatus('Backup service has not been created.');
+  if (!container.running) return unavailableBackupStatus('Backup service is stopped.', 'stopped');
+  const result = await runCommand('docker', ['exec', container.id, 'fleet-backup', 'status'], { cwd: projectRoot, timeoutMs: 15_000 });
+  if (result.code !== 0) return unavailableBackupStatus((result.stderr || 'Unable to read backup status.').trim(), 'running');
+  try {
+    const status = JSON.parse(result.stdout) as Omit<BackupStatus, 'containerState' | 'schedule' | 'destination'>;
+    const restoreTarget = status.restoreTarget?.startsWith('/restore/')
+      ? path.join(projectRoot, 'backup-restore', status.restoreTarget.slice('/restore/'.length))
+      : status.restoreTarget;
+    return { ...status, restoreTarget, containerState: 'running', schedule: 'Daily at 10:00 AM ET', destination: backupDestination };
+  } catch {
+    return unavailableBackupStatus('Backup service returned invalid status.', 'running');
+  }
+}
+
+async function readBackupSnapshots(): Promise<BackupSnapshot[]> {
+  if (!dockerEnabled) return [];
+  const container = await backupContainer();
+  if (!container?.running) return [];
+  const result = await runCommand('docker', ['exec', container.id, 'fleet-backup', 'snapshots-json'], { cwd: projectRoot, timeoutMs: 30_000 });
+  if (result.code !== 0) throw new Error((result.stderr || result.stdout || 'Unable to list backup snapshots.').trim());
+  const snapshots = JSON.parse(result.stdout) as Array<{
+    id?: string;
+    short_id?: string;
+    time?: string;
+    hostname?: string;
+    paths?: string[];
+    summary?: { total_files_processed?: number; total_bytes_processed?: number };
+  }>;
+  if (!Array.isArray(snapshots)) throw new Error('Backup service returned an invalid snapshot list.');
+  return snapshots
+    .filter(snapshot => typeof snapshot.id === 'string' && typeof snapshot.time === 'string')
+    .map(snapshot => {
+      const paths = Array.isArray(snapshot.paths) ? snapshot.paths : [];
+      const fileCount = Number(snapshot.summary?.total_files_processed || 0);
+      return {
+        id: snapshot.id!,
+        shortId: snapshot.short_id || snapshot.id!.slice(0, 8),
+        time: snapshot.time!,
+        hostname: snapshot.hostname || 'unknown',
+        fileCount,
+        totalBytes: Number(snapshot.summary?.total_bytes_processed || 0),
+        restorable: snapshot.hostname === 'fleet-backup' && fileCount > 0 && paths.some(item => item === '/staging/current/volumes'),
+      };
+    })
+    .sort((left, right) => right.time.localeCompare(left.time));
+}
+
+async function startBackupOperation(action: 'run' | 'check'): Promise<BackupStatus> {
+  const container = await backupContainer();
+  if (!container) throw new Error('Backup service has not been created.');
+  if (!container.running) throw new Error('Backup service is stopped.');
+  const current = await readBackupStatus();
+  if (current.state === 'running' || current.state === 'verifying' || current.state === 'restoring') throw new ContributionError('Another backup operation is already running.', 409);
+  const result = await runCommand('docker', ['exec', '-d', container.id, 'fleet-backup', action], { cwd: projectRoot, timeoutMs: 15_000 });
+  if (result.code !== 0) throw new Error((result.stderr || result.stdout || 'Unable to start the backup operation.').trim());
+  return {
+    ...current,
+    state: action === 'run' ? 'running' : 'verifying',
+    operation: action === 'run' ? 'backup' : 'verify',
+    message: action === 'run' ? 'Backup started.' : 'Backup verification started.',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function startRestoreOperation(snapshotId: string): Promise<BackupStatus> {
+  const container = await backupContainer();
+  if (!container) throw new Error('Backup service has not been created.');
+  if (!container.running) throw new Error('Backup service is stopped.');
+  const current = await readBackupStatus();
+  if (current.state === 'running' || current.state === 'verifying' || current.state === 'restoring') {
+    throw new ContributionError('Another backup operation is already running.', 409);
+  }
+  const snapshots = await readBackupSnapshots();
+  const snapshot = snapshots.find(item => item.id === snapshotId);
+  if (!snapshot?.restorable) throw new ContributionError('That snapshot is not available for safe restore.', 422);
+  const result = await runCommand('docker', ['exec', '-d', container.id, 'fleet-backup', 'restore', snapshot.id], { cwd: projectRoot, timeoutMs: 15_000 });
+  if (result.code !== 0) throw new Error((result.stderr || result.stdout || 'Unable to start the restore operation.').trim());
+  return {
+    ...current,
+    state: 'restoring',
+    operation: 'restore',
+    message: `Restoring snapshot ${snapshot.shortId} into a safe staging folder.`,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function activity(kind: ActivityRecord['kind'], tone: ActivityRecord['tone'], title: string, detail: string, deploymentId?: string): ActivityRecord {
   return { id: crypto.randomUUID(), kind, tone, title, detail, deploymentId, createdAt: new Date().toISOString() };
 }
@@ -381,7 +511,62 @@ async function prepareContribution(tenantId: string, selector: string, requestId
   });
 }
 
-async function publishContribution(tenantId: string, contributionId: string, input: { expectedBaseSha: string; message: string; branch?: string }): Promise<Contribution> {
+function approvalHash(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function publicContribution(contribution: Contribution): Omit<Contribution, 'approvalTokenHash'> {
+  const { approvalTokenHash: _approvalTokenHash, ...visible } = contribution;
+  return visible;
+}
+
+function publicState(state: FleetState): Omit<FleetState, 'contributions'> & { contributions: Array<Omit<Contribution, 'approvalTokenHash'>> } {
+  return { ...state, contributions: state.contributions.map(publicContribution) };
+}
+
+function approvalTokenFromPath(value: string): string {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(value)) throw new ContributionError('Approval link is invalid.', 404);
+  return value;
+}
+
+function contributionApproval(state: FleetState, token: string): { index: number; contribution: Contribution } {
+  const hash = approvalHash(approvalTokenFromPath(token));
+  const index = state.contributions.findIndex(item => item.approvalTokenHash === hash);
+  if (index < 0) throw new ContributionError('Approval link is invalid or no longer active.', 404);
+  const contribution = state.contributions[index];
+  if (!contribution.approvalExpiresAt || Date.parse(contribution.approvalExpiresAt) <= Date.now()) {
+    throw new ContributionError('Approval link has expired. Ask the agent to run fleet-contribute ready again.', 410);
+  }
+  return { index, contribution };
+}
+
+function approvalView(state: FleetState, contribution: Contribution): ContributionApproval {
+  const repository = state.contributionRepositories.find(item => item.id === contribution.repositoryId);
+  const tenant = state.deployments.find(item => item.id === contribution.tenantId);
+  if (!repository || !tenant || !contribution.approvalExpiresAt) throw new ContributionError('Approval record is incomplete.', 409);
+  return {
+    id: contribution.id,
+    tenantId: contribution.tenantId,
+    tenantName: tenant.name,
+    repositoryAlias: contribution.repositoryAlias,
+    repositoryRemote: repository.remote,
+    defaultBranch: repository.defaultBranch,
+    branch: contribution.branch,
+    baseSha: contribution.baseSha,
+    status: contribution.status,
+    commitMessage: contribution.commitMessage,
+    preparedCommitSha: contribution.preparedCommitSha,
+    changedFiles: contribution.changedFiles ?? [],
+    changedBytes: contribution.changedBytes ?? 0,
+    validationSummary: contribution.validationSummary,
+    approvalExpiresAt: contribution.approvalExpiresAt,
+    branchUrl: contribution.branchUrl,
+    pullRequestUrl: contribution.pullRequestUrl,
+    publishedSha: contribution.publishedSha,
+  };
+}
+
+async function readyContribution(tenantId: string, contributionId: string, input: { expectedBaseSha: string; message: string }): Promise<{ contribution: Contribution; approvalUrl: string }> {
   let state = await readState();
   const initial = state.contributions.find(item => item.id === contributionId && item.tenantId === tenantId);
   if (!initial) throw new ContributionError('Contribution not found.', 404);
@@ -391,12 +576,52 @@ async function publishContribution(tenantId: string, contributionId: string, inp
     if (index < 0) throw new ContributionError('Contribution not found.', 404);
     const current = state.contributions[index];
     const repository = assignedRepository(state, tenantId, current.repositoryId);
-    const published = await contributionRuntime.publish(current, repository, input);
+    const ready = await contributionRuntime.ready(current, repository, input);
+    const token = randomBytes(32).toString('base64url');
+    const prepared = {
+      ...ready,
+      approvalTokenHash: approvalHash(token),
+      approvalExpiresAt: new Date(Date.now() + approvalTtlMs).toISOString(),
+      updatedAt: new Date().toISOString(),
+    } satisfies Contribution;
+    state.contributions[index] = prepared;
+    state.activities.unshift(activity('contribution', 'blue', `${repository.alias} contribution ready for approval`, prepared.branch, tenantId));
+    state.activities = state.activities.slice(0, 500);
+    await writeState(state);
+    return { contribution: prepared, approvalUrl: `${publicUrl}/contributions/approve/${token}` };
+  });
+}
+
+async function publishApprovedContribution(token: string): Promise<Contribution> {
+  let state = await readState();
+  const initial = contributionApproval(state, token).contribution;
+  return await contributionRuntime.locked(initial.repositoryId, async () => {
+    state = await readState();
+    const { index, contribution: current } = contributionApproval(state, token);
+    if (current.status === 'published') return current;
+    const repository = assignedRepository(state, current.tenantId, current.repositoryId);
+    const published = await contributionRuntime.publish(current, repository);
     state.contributions[index] = published;
-    state.activities.unshift(activity('contribution', 'green', `${repository.alias} contribution published`, published.branch, tenantId));
+    state.activities.unshift(activity('contribution', 'green', `${repository.alias} contribution published`, published.branch, current.tenantId));
     state.activities = state.activities.slice(0, 500);
     await writeState(state);
     return published;
+  });
+}
+
+async function abortApprovedContribution(token: string): Promise<Contribution> {
+  let state = await readState();
+  const initial = contributionApproval(state, token).contribution;
+  return await contributionRuntime.locked(initial.repositoryId, async () => {
+    state = await readState();
+    const { index, contribution: current } = contributionApproval(state, token);
+    if (current.status === 'aborted') return current;
+    const aborted = await contributionRuntime.abort(current);
+    state.contributions[index] = aborted;
+    state.activities.unshift(activity('contribution', 'amber', `${aborted.repositoryAlias} contribution aborted by operator`, aborted.branch, aborted.tenantId));
+    state.activities = state.activities.slice(0, 500);
+    await writeState(state);
+    return aborted;
   });
 }
 
@@ -428,29 +653,31 @@ async function executeContributionBrokerRequest(tenantId: string, method: string
   }
   if (method === 'POST' && pathname === '/prepare') {
     const result = await prepareContribution(tenantId, typeof body.repository === 'string' ? body.repository : '', typeof body.requestId === 'string' ? body.requestId : '');
-    return { statusCode: result.created ? 201 : 200, body: { contribution: result.contribution } };
+    return { statusCode: result.created ? 201 : 200, body: { contribution: publicContribution(result.contribution) } };
   }
   if (method === 'GET' && pathname === '/contributions') {
     const state = await readState();
-    return { statusCode: 200, body: { contributions: state.contributions.filter(item => item.tenantId === tenantId) } };
+    return { statusCode: 200, body: { contributions: state.contributions.filter(item => item.tenantId === tenantId).map(publicContribution) } };
   }
-  const match = pathname.match(/^\/contributions\/([a-f0-9-]+)(?:\/(publish|abort))?$/);
+  const match = pathname.match(/^\/contributions\/([a-f0-9-]+)(?:\/(ready|publish|abort))?$/);
   if (match && method === 'GET' && !match[2]) {
     const state = await readState();
     const contribution = state.contributions.find(item => item.id === match[1] && item.tenantId === tenantId);
     if (!contribution) throw new ContributionError('Contribution not found.', 404);
-    return { statusCode: 200, body: { contribution } };
+    return { statusCode: 200, body: { contribution: publicContribution(contribution) } };
   }
-  if (match && method === 'POST' && match[2] === 'publish') {
-    const contribution = await publishContribution(tenantId, match[1], {
+  if (match && method === 'POST' && match[2] === 'ready') {
+    const result = await readyContribution(tenantId, match[1], {
       expectedBaseSha: typeof body.expectedBaseSha === 'string' ? body.expectedBaseSha : '',
       message: typeof body.message === 'string' ? body.message : '',
-      branch: typeof body.branch === 'string' ? body.branch : undefined,
     });
-    return { statusCode: 200, body: { contribution } };
+    return { statusCode: 200, body: { ...result, contribution: publicContribution(result.contribution) } };
+  }
+  if (match && method === 'POST' && match[2] === 'publish') {
+    return { statusCode: 403, body: { error: 'Publishing requires operator approval through the Fleet review link.' } };
   }
   if (match && method === 'POST' && match[2] === 'abort') {
-    return { statusCode: 200, body: { contribution: await abortContribution(tenantId, match[1]) } };
+    return { statusCode: 200, body: { contribution: publicContribution(await abortContribution(tenantId, match[1])) } };
   }
   return { statusCode: 404, body: { error: 'Contribution broker route not found.' } };
 }
@@ -634,9 +861,62 @@ function requireApiToken(request: IncomingMessage): boolean {
 }
 
 async function handleApi(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+  const approvalMatch = url.pathname.match(/^\/api\/contribution-approvals\/([A-Za-z0-9_-]{43})(?:\/(publish|abort))?$/);
+  if (approvalMatch) {
+    try {
+      const token = approvalMatch[1];
+      if (request.method === 'GET' && !approvalMatch[2]) {
+        const state = await readState();
+        const { contribution } = contributionApproval(state, token);
+        return sendJson(response, 200, { approval: approvalView(state, contribution) });
+      }
+      if (request.method === 'POST' && approvalMatch[2] === 'publish') {
+        await parseBody(request);
+        const contribution = await publishApprovedContribution(token);
+        const state = await readState();
+        return sendJson(response, 200, { approval: approvalView(state, contribution) });
+      }
+      if (request.method === 'POST' && approvalMatch[2] === 'abort') {
+        await parseBody(request);
+        const contribution = await abortApprovedContribution(token);
+        const state = await readState();
+        return sendJson(response, 200, { approval: approvalView(state, contribution) });
+      }
+      return sendJson(response, 405, { error: 'Approval action is not supported.' });
+    } catch (error) {
+      return sendJson(response, contributionErrorStatus(error), { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
   if (!requireApiToken(request)) return sendJson(response, 401, { error: 'Unauthorized.' });
   if (request.method === 'GET' && url.pathname === '/api/health') return sendJson(response, 200, { ok: true, dockerEnabled, root: projectRoot });
-  if (request.method === 'GET' && (url.pathname === '/api/state' || url.pathname === '/api/deployments')) return sendJson(response, 200, await readState());
+  if (request.method === 'GET' && (url.pathname === '/api/state' || url.pathname === '/api/deployments')) return sendJson(response, 200, publicState(await readState()));
+
+  if (request.method === 'GET' && url.pathname === '/api/backups/status') {
+    try { return sendJson(response, 200, { backup: await readBackupStatus() }); }
+    catch (error) { return sendJson(response, 503, { error: error instanceof Error ? error.message : String(error) }); }
+  }
+  if (request.method === 'GET' && url.pathname === '/api/backups/snapshots') {
+    try { return sendJson(response, 200, { snapshots: await readBackupSnapshots() }); }
+    catch (error) { return sendJson(response, 503, { error: error instanceof Error ? error.message : String(error) }); }
+  }
+  if (request.method === 'POST' && /^\/api\/backups\/(run|verify)$/.test(url.pathname)) {
+    try {
+      await parseBody(request);
+      const action = url.pathname.endsWith('/run') ? 'run' : 'check';
+      return sendJson(response, 202, { backup: await startBackupOperation(action) });
+    } catch (error) {
+      return sendJson(response, error instanceof ContributionError ? error.statusCode : 503, { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (request.method === 'POST' && url.pathname === '/api/backups/restore') {
+    try {
+      const body = await parseBody(request) as { snapshotId?: unknown };
+      if (typeof body?.snapshotId !== 'string') throw new ContributionError('A snapshot ID is required.', 422);
+      return sendJson(response, 202, { backup: await startRestoreOperation(body.snapshotId) });
+    } catch (error) {
+      return sendJson(response, error instanceof ContributionError ? error.statusCode : 503, { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
 
   if (request.method === 'GET' && url.pathname === '/api/contribution-repositories') {
     const state = await readState();
@@ -727,26 +1007,30 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
     }
   }
   if (request.method === 'GET' && suffix === 'contributions') {
-    return sendJson(response, 200, { contributions: state.contributions.filter(item => item.tenantId === id) });
+    return sendJson(response, 200, { contributions: state.contributions.filter(item => item.tenantId === id).map(publicContribution) });
   }
-  const contributionAction = suffix.match(/^contributions\/([a-f0-9-]+)(?:\/(publish|abort))?$/);
+  const contributionAction = suffix.match(/^contributions\/([a-f0-9-]+)(?:\/(ready|publish|abort))?$/);
   if (contributionAction && request.method === 'GET' && !contributionAction[2]) {
     const contribution = state.contributions.find(item => item.id === contributionAction[1] && item.tenantId === id);
-    return contribution ? sendJson(response, 200, { contribution }) : sendJson(response, 404, { error: 'Contribution not found.' });
+    return contribution ? sendJson(response, 200, { contribution: publicContribution(contribution) }) : sendJson(response, 404, { error: 'Contribution not found.' });
   }
-  if (contributionAction && request.method === 'POST' && contributionAction[2] === 'publish') {
+  if (contributionAction && request.method === 'POST' && contributionAction[2] === 'ready') {
     try {
-      const body = await parseBody(request) as { expectedBaseSha?: string; message?: string; branch?: string };
-      const contribution = await publishContribution(id, contributionAction[1], { expectedBaseSha: body.expectedBaseSha ?? '', message: body.message ?? '', branch: body.branch });
-      return sendJson(response, 200, { contribution });
+      const body = await parseBody(request) as { expectedBaseSha?: string; message?: string };
+      const result = await readyContribution(id, contributionAction[1], { expectedBaseSha: body.expectedBaseSha ?? '', message: body.message ?? '' });
+      return sendJson(response, 200, { ...result, contribution: publicContribution(result.contribution) });
     } catch (error) {
       return sendJson(response, contributionErrorStatus(error), { error: error instanceof Error ? error.message : String(error) });
     }
   }
+  if (contributionAction && request.method === 'POST' && contributionAction[2] === 'publish') {
+    await parseBody(request);
+    return sendJson(response, 403, { error: 'Publishing requires operator approval through the Fleet review link.' });
+  }
   if (contributionAction && request.method === 'POST' && contributionAction[2] === 'abort') {
     try {
       await parseBody(request);
-      return sendJson(response, 200, { contribution: await abortContribution(id, contributionAction[1]) });
+      return sendJson(response, 200, { contribution: publicContribution(await abortContribution(id, contributionAction[1])) });
     } catch (error) {
       return sendJson(response, contributionErrorStatus(error), { error: error instanceof Error ? error.message : String(error) });
     }
